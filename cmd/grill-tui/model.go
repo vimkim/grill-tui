@@ -39,6 +39,16 @@ func (worksheetModel) Init() tea.Cmd {
 }
 
 func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	if copied, ok := message.(clipboardResultMsg); ok {
+		if copied.empty {
+			model.status = "No answers to copy; clipboard unchanged"
+		} else if copied.err != nil {
+			model.status = fmt.Sprintf("Could not copy Answer List: %v", copied.err)
+		} else {
+			model.status = fmt.Sprintf("Answer List copied using %s", copied.backend)
+		}
+		return model, nil
+	}
 	if finished, ok := message.(externalEditorFinishedMsg); ok {
 		if finished.err != nil {
 			model.status = fmt.Sprintf("External editor failed; Answer Slot unchanged: %v", finished.err)
@@ -136,6 +146,8 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			candidate, number := model.worksheet.withUndo()
 			return model.persistWorksheet(candidate, fmt.Sprintf("Undid Answer Slot %d", number)), nil
+		case "s", "ctrl+s":
+			return model, copyAnswerList(model.worksheet)
 		case "i":
 			model.mode = inlineAnswerMode
 			model.editInput = model.worksheet.Slots[model.worksheet.Selected].Answer
@@ -297,7 +309,7 @@ func (model worksheetModel) worksheetView() string {
 	}
 	fmt.Fprintf(&view, "\nStatus: %s\n", status)
 	view.WriteString("Help: ↑/↓ j/k Ctrl-N/Ctrl-P move • Space skip • q quit\n")
-	view.WriteString("Answers: r/y/n 1-5 a-e x preset • i inline • o editor • Esc clear • u undo\n")
+	view.WriteString("Answers: r/y/n 1-5 a-e x preset • i inline • o editor • Esc clear • u undo • s/Ctrl-S copy\n")
 	return view.String()
 }
 

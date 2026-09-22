@@ -1,0 +1,18 @@
+{
+  "slots": [
+    {
+      "number": 998,
+      "answer": "alpha"
+    },
+    {
+      "number": 999,
+      "answer": ""
+    },
+    {
+      "number": 1000,
+      "answer": "first 界\nsecond line"
+    }
+  ],
+  "selected": 0,
+  "viewport": 0
+}

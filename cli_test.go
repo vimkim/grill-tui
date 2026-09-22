@@ -2,6 +2,8 @@ package grilltui_test
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -12,12 +14,15 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/creack/pty"
 	"github.com/mattn/go-runewidth"
 )
 
 var grillTUIBinary string
+
+const exactAnswerListFixture = "998. alpha\n1000. first 界\n      second line"
 
 func TestMain(m *testing.M) {
 	tempDir, err := os.MkdirTemp("", "grill-tui-tests-")
@@ -813,6 +818,381 @@ func TestLongAnswerIsTruncatedInGridAndShownInFullPreview(t *testing.T) {
 	}
 }
 
+func TestSCopiesExactAnswerListToWaylandClipboard(t *testing.T) {
+	workingDir := t.TempDir()
+	installCopyAnswerListFixture(t, workingDir)
+	fixtureDir := t.TempDir()
+	capturePath := filepath.Join(fixtureDir, "clipboard")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "wl-copy"), "#!/bin/sh\n/bin/cat > \"$CAPTURE\"\n")
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{values: map[string]string{
+		"PATH":            fixtureDir,
+		"WAYLAND_DISPLAY": "wayland-test",
+		"CAPTURE":         capturePath,
+	}})
+	copyAndExit(t, terminal, "s", "Answer List copied")
+
+	copied, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("read Wayland clipboard capture: %v", err)
+	}
+	want := exactAnswerListFixture
+	if string(copied) != want {
+		t.Fatalf("copied Answer List = %q, want %q", copied, want)
+	}
+}
+
+func TestCopyWithNoAnswersLeavesClipboardUnchanged(t *testing.T) {
+	fixtureDir := t.TempDir()
+	capturePath := filepath.Join(fixtureDir, "clipboard")
+	if err := os.WriteFile(capturePath, []byte("keep this"), 0o600); err != nil {
+		t.Fatalf("seed clipboard capture: %v", err)
+	}
+	writeEditorFixture(t, filepath.Join(fixtureDir, "wl-copy"), "#!/bin/sh\n/bin/cat > \"$CAPTURE\"\n")
+
+	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{values: map[string]string{
+		"PATH":            fixtureDir,
+		"WAYLAND_DISPLAY": "wayland-test",
+		"CAPTURE":         capturePath,
+	}}, "20")
+	copyAndExit(t, terminal, "s", "No answers to copy; clipboard unchanged")
+
+	copied, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("read clipboard capture: %v", err)
+	}
+	if string(copied) != "keep this" {
+		t.Fatalf("clipboard changed to %q, want existing content preserved", copied)
+	}
+}
+
+func TestCtrlSCopiesAnswerListWhenDelivered(t *testing.T) {
+	fixtureDir := t.TempDir()
+	capturePath := filepath.Join(fixtureDir, "clipboard")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "wl-copy"), "#!/bin/sh\n/bin/cat > \"$CAPTURE\"\n")
+	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{values: map[string]string{
+		"PATH":            fixtureDir,
+		"WAYLAND_DISPLAY": "wayland-test",
+		"CAPTURE":         capturePath,
+	}}, "20")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 21)
+
+	copyAndExit(t, terminal, "\x13", "Answer List copied")
+
+	copied, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("read clipboard capture: %v", err)
+	}
+	if string(copied) != "20. recommended" {
+		t.Fatalf("copied Answer List = %q, want %q", copied, "20. recommended")
+	}
+}
+
+func TestWSLClipboardTakesPrecedenceAndReceivesUTF16LEWithCRLF(t *testing.T) {
+	workingDir := t.TempDir()
+	installCopyAnswerListFixture(t, workingDir)
+	fixtureDir := t.TempDir()
+	clipCapture := filepath.Join(fixtureDir, "clip-capture")
+	waylandCapture := filepath.Join(fixtureDir, "wayland-capture")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "clip.exe"), "#!/bin/sh\n/bin/cat > \"$CLIP_CAPTURE\"\n")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "wl-copy"), "#!/bin/sh\n/bin/cat > \"$WAYLAND_CAPTURE\"\n")
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{values: map[string]string{
+		"PATH":            fixtureDir,
+		"WSL_DISTRO_NAME": "Test Linux",
+		"WAYLAND_DISPLAY": "wayland-test",
+		"CLIP_CAPTURE":    clipCapture,
+		"WAYLAND_CAPTURE": waylandCapture,
+	}})
+	copyAndExit(t, terminal, "s", "Answer List copied using clip.exe")
+
+	copied, err := os.ReadFile(clipCapture)
+	if err != nil {
+		t.Fatalf("read WSL clipboard capture: %v", err)
+	}
+	wantText := "998. alpha\r\n1000. first 界\r\n      second line"
+	codeUnits := utf16.Encode([]rune(wantText))
+	want := make([]byte, len(codeUnits)*2)
+	for index, codeUnit := range codeUnits {
+		binary.LittleEndian.PutUint16(want[index*2:], codeUnit)
+	}
+	if !bytes.Equal(copied, want) {
+		t.Fatalf("clip.exe stdin bytes = %x, want UTF-16LE bytes %x", copied, want)
+	}
+	if _, err := os.Stat(waylandCapture); !os.IsNotExist(err) {
+		t.Fatalf("wl-copy ran despite WSL precedence; stat error = %v", err)
+	}
+}
+
+func TestClipboardFailureFallsBackToNextEnvironmentBackend(t *testing.T) {
+	workingDir := t.TempDir()
+	installCopyAnswerListFixture(t, workingDir)
+	fixtureDir := t.TempDir()
+	waylandCapture := filepath.Join(fixtureDir, "wayland-capture")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "clip.exe"), "#!/bin/sh\nexit 23\n")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "wl-copy"), "#!/bin/sh\n/bin/cat > \"$WAYLAND_CAPTURE\"\n")
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{values: map[string]string{
+		"PATH":            fixtureDir,
+		"WSL_DISTRO_NAME": "Test Linux",
+		"WAYLAND_DISPLAY": "wayland-test",
+		"WAYLAND_CAPTURE": waylandCapture,
+	}})
+	copyAndExit(t, terminal, "s", "Answer List copied using wl-copy")
+
+	copied, err := os.ReadFile(waylandCapture)
+	if err != nil {
+		t.Fatalf("read Wayland fallback capture: %v", err)
+	}
+	if string(copied) != exactAnswerListFixture {
+		t.Fatalf("Wayland fallback received %q", copied)
+	}
+}
+
+func TestClipboardLaunchFailureFallsBackToNextEnvironmentBackend(t *testing.T) {
+	workingDir := t.TempDir()
+	installCopyAnswerListFixture(t, workingDir)
+	fixtureDir := t.TempDir()
+	xclipCapture := filepath.Join(fixtureDir, "xclip-capture")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "wl-copy"), "not an executable format\n")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "xclip"), "#!/bin/sh\n/bin/cat > \"$XCLIP_CAPTURE\"\n")
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{
+		values: map[string]string{
+			"PATH":            fixtureDir,
+			"WAYLAND_DISPLAY": "wayland-test",
+			"DISPLAY":         ":99",
+			"XCLIP_CAPTURE":   xclipCapture,
+		},
+		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP"},
+	})
+	copyAndExit(t, terminal, "s", "Answer List copied using xclip")
+
+	copied, err := os.ReadFile(xclipCapture)
+	if err != nil {
+		t.Fatalf("read X11 fallback capture: %v", err)
+	}
+	if string(copied) != exactAnswerListFixture {
+		t.Fatalf("xclip received %q", copied)
+	}
+}
+
+func TestClipboardWriteFailureFallsBackToNextEnvironmentBackend(t *testing.T) {
+	workingDir := t.TempDir()
+	largeAnswer := strings.Repeat("a", 1<<20)
+	directory := filepath.Join(workingDir, ".grill-tui")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatalf("create persisted Worksheet directory: %v", err)
+	}
+	fixture := fmt.Sprintf(`{"slots":[{"number":1,"answer":"%s"}],"selected":0,"viewport":0}`, largeAnswer)
+	if err := os.WriteFile(filepath.Join(directory, "worksheet.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatalf("write persisted Worksheet: %v", err)
+	}
+
+	fixtureDir := t.TempDir()
+	xclipCapture := filepath.Join(fixtureDir, "xclip-capture")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "wl-copy"), "#!/bin/sh\nexec 0<&-\n/bin/sleep 0.2\n")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "xclip"), "#!/bin/sh\n/bin/cat > \"$XCLIP_CAPTURE\"\n")
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{
+		values: map[string]string{
+			"PATH":            fixtureDir,
+			"WAYLAND_DISPLAY": "wayland-test",
+			"DISPLAY":         ":99",
+			"XCLIP_CAPTURE":   xclipCapture,
+		},
+		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP"},
+	})
+	copyAndExit(t, terminal, "s", "Answer List copied using xclip")
+
+	copied, err := os.ReadFile(xclipCapture)
+	if err != nil {
+		t.Fatalf("read X11 fallback capture: %v", err)
+	}
+	want := "1. " + largeAnswer
+	if string(copied) != want {
+		t.Fatalf("xclip received %d bytes, want %d", len(copied), len(want))
+	}
+}
+
+func TestX11ClipboardPrefersXclipWithClipboardSelection(t *testing.T) {
+	workingDir := t.TempDir()
+	installCopyAnswerListFixture(t, workingDir)
+	fixtureDir := t.TempDir()
+	xclipCapture := filepath.Join(fixtureDir, "xclip-capture")
+	argsCapture := filepath.Join(fixtureDir, "args-capture")
+	xselCapture := filepath.Join(fixtureDir, "xsel-capture")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "xclip"), "#!/bin/sh\nprintf '%s' \"$*\" > \"$ARGS_CAPTURE\"\n/bin/cat > \"$XCLIP_CAPTURE\"\n")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "xsel"), "#!/bin/sh\n/bin/cat > \"$XSEL_CAPTURE\"\n")
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{
+		values: map[string]string{
+			"PATH":          fixtureDir,
+			"DISPLAY":       ":99",
+			"XCLIP_CAPTURE": xclipCapture,
+			"ARGS_CAPTURE":  argsCapture,
+			"XSEL_CAPTURE":  xselCapture,
+		},
+		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP", "WAYLAND_DISPLAY"},
+	})
+	copyAndExit(t, terminal, "s", "Answer List copied using xclip")
+
+	copied, err := os.ReadFile(xclipCapture)
+	if err != nil {
+		t.Fatalf("read xclip capture: %v", err)
+	}
+	if string(copied) != exactAnswerListFixture {
+		t.Fatalf("xclip received %q", copied)
+	}
+	args, err := os.ReadFile(argsCapture)
+	if err != nil {
+		t.Fatalf("read xclip args: %v", err)
+	}
+	if string(args) != "-selection clipboard" {
+		t.Fatalf("xclip args = %q, want %q", args, "-selection clipboard")
+	}
+	if _, err := os.Stat(xselCapture); !os.IsNotExist(err) {
+		t.Fatalf("xsel ran despite xclip precedence; stat error = %v", err)
+	}
+}
+
+func TestX11ClipboardFallsBackFromXclipToXsel(t *testing.T) {
+	workingDir := t.TempDir()
+	installCopyAnswerListFixture(t, workingDir)
+	fixtureDir := t.TempDir()
+	xselCapture := filepath.Join(fixtureDir, "xsel-capture")
+	argsCapture := filepath.Join(fixtureDir, "args-capture")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "xclip"), "#!/bin/sh\nexit 17\n")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "xsel"), "#!/bin/sh\nprintf '%s' \"$*\" > \"$ARGS_CAPTURE\"\n/bin/cat > \"$XSEL_CAPTURE\"\n")
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{
+		values: map[string]string{
+			"PATH":         fixtureDir,
+			"DISPLAY":      ":99",
+			"XSEL_CAPTURE": xselCapture,
+			"ARGS_CAPTURE": argsCapture,
+		},
+		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP", "WAYLAND_DISPLAY"},
+	})
+	copyAndExit(t, terminal, "s", "Answer List copied using xsel")
+
+	copied, err := os.ReadFile(xselCapture)
+	if err != nil {
+		t.Fatalf("read xsel capture: %v", err)
+	}
+	if string(copied) != exactAnswerListFixture {
+		t.Fatalf("xsel received %q", copied)
+	}
+	args, err := os.ReadFile(argsCapture)
+	if err != nil {
+		t.Fatalf("read xsel args: %v", err)
+	}
+	if string(args) != "--clipboard --input" {
+		t.Fatalf("xsel args = %q, want %q", args, "--clipboard --input")
+	}
+}
+
+func TestClipboardFallsBackToOSC52(t *testing.T) {
+	workingDir := t.TempDir()
+	installCopyAnswerListFixture(t, workingDir)
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{
+		values: map[string]string{"PATH": t.TempDir()},
+		removed: []string{
+			"WSL_DISTRO_NAME", "WSL_INTEROP", "WAYLAND_DISPLAY", "DISPLAY",
+		},
+	})
+
+	copyAndExit(t, terminal, "s", "Answer List copied using OSC 52")
+
+	wantSequence := "\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(exactAnswerListFixture)) + "\a"
+	if output := terminal.output.String(); !strings.Contains(output, wantSequence) {
+		t.Fatalf("terminal output does not contain exact OSC 52 sequence %q; output: %q", wantSequence, output)
+	}
+}
+
+func TestWaylandClipboardTakesPrecedenceOverX11(t *testing.T) {
+	workingDir := t.TempDir()
+	installCopyAnswerListFixture(t, workingDir)
+	fixtureDir := t.TempDir()
+	waylandCapture := filepath.Join(fixtureDir, "wayland-capture")
+	xclipCapture := filepath.Join(fixtureDir, "xclip-capture")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "wl-copy"), "#!/bin/sh\n/bin/cat > \"$WAYLAND_CAPTURE\"\n")
+	writeEditorFixture(t, filepath.Join(fixtureDir, "xclip"), "#!/bin/sh\n/bin/cat > \"$XCLIP_CAPTURE\"\n")
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{
+		values: map[string]string{
+			"PATH":            fixtureDir,
+			"WAYLAND_DISPLAY": "wayland-test",
+			"DISPLAY":         ":99",
+			"WAYLAND_CAPTURE": waylandCapture,
+			"XCLIP_CAPTURE":   xclipCapture,
+		},
+		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP"},
+	})
+	copyAndExit(t, terminal, "s", "Answer List copied using wl-copy")
+
+	if _, err := os.Stat(waylandCapture); err != nil {
+		t.Fatalf("Wayland clipboard did not run: %v", err)
+	}
+	if _, err := os.Stat(xclipCapture); !os.IsNotExist(err) {
+		t.Fatalf("xclip ran despite Wayland precedence; stat error = %v", err)
+	}
+}
+
+func TestCopyFailureIsActionableAndLeavesWorksheetUnchanged(t *testing.T) {
+	workingDir := t.TempDir()
+	installCopyAnswerListFixture(t, workingDir)
+	statePath := filepath.Join(workingDir, ".grill-tui", "worksheet.json")
+	before, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read Worksheet before failed copy: %v", err)
+	}
+	fixtureDir := t.TempDir()
+	for _, executable := range []string{"wl-copy", "xclip", "xsel"} {
+		writeEditorFixture(t, filepath.Join(fixtureDir, executable), "#!/bin/sh\nexit 19\n")
+	}
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{
+		values: map[string]string{
+			"PATH":            fixtureDir,
+			"TERM":            "dumb",
+			"WAYLAND_DISPLAY": "wayland-test",
+			"DISPLAY":         ":99",
+		},
+		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP"},
+	})
+	terminal.send(t, "s")
+	screen := terminal.waitFor(t, "Could not copy Answer List: all backends failed")
+	if !strings.Contains(screen, "check clipboard tools or OSC 52 support") {
+		t.Fatalf("failed-copy status is not actionable:\n%s", screen)
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	after, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read Worksheet after failed copy: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("failed copy changed Worksheet state\nbefore: %s\nafter: %s", before, after)
+	}
+}
+
+func installCopyAnswerListFixture(t *testing.T, workingDir string) {
+	t.Helper()
+	installWorksheetFixture(t, workingDir, filepath.Join("testdata", "copy-answer-list-worksheet.json"))
+}
+
+func copyAndExit(t *testing.T, terminal *testTerminal, key, status string) string {
+	t.Helper()
+	terminal.send(t, key)
+	screen := terminal.waitFor(t, status)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+	return screen
+}
+
 func installWorksheetFixture(t *testing.T, workingDir, fixturePath string) {
 	t.Helper()
 	fixture, err := os.ReadFile(fixturePath)
@@ -878,7 +1258,9 @@ func startTerminalWithEnvironment(t *testing.T, workingDir string, overrides env
 	for name, value := range overrides.values {
 		environment[name] = value
 	}
-	environment["TERM"] = "xterm-256color"
+	if _, overridden := overrides.values["TERM"]; !overridden {
+		environment["TERM"] = "xterm-256color"
+	}
 	environment["NO_COLOR"] = "1"
 	cmd.Env = make([]string, 0, len(environment))
 	for name, value := range environment {

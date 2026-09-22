@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -36,6 +37,19 @@ type worksheetUndo struct {
 	Slots    []answerSlot `json:"slots"`
 	Selected int          `json:"selected"`
 	Viewport int          `json:"viewport"`
+}
+
+func (storedWorksheet worksheet) answerList() string {
+	var answers []string
+	for _, slot := range storedWorksheet.Slots {
+		if slot.Answer == "" {
+			continue
+		}
+		indent := strings.Repeat(" ", len(strconv.Itoa(slot.Number))+2)
+		answer := strings.ReplaceAll(slot.Answer, "\n", "\n"+indent)
+		answers = append(answers, fmt.Sprintf("%d. %s", slot.Number, answer))
+	}
+	return strings.Join(answers, "\n")
 }
 
 func (storedWorksheet *worksheet) revealSelection() {
