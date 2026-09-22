@@ -24,6 +24,16 @@ var grillTUIBinary string
 
 const exactAnswerListFixture = "998. alpha\n1000. first 界\n      second line"
 
+var completeHelpBindingDescriptions = []string{
+	"Move: ↑/↓, j/k, Ctrl-N/Ctrl-P", "Skip: Space",
+	"Presets: r/R recommended; y/Y yes; n/N no", "Choices: 1–5; a–e/A–E",
+	"Explain: x", "Custom: i inline; o external editor",
+	"Inline edit: Enter commit; Esc cancel",
+	"Correct: Esc clear; u undo", "Mouse: left click select; wheel scroll",
+	"Copy: s/Ctrl-S",
+	"Help: ?; Quit: q, Ctrl-Q, Ctrl-C",
+}
+
 func TestMain(m *testing.M) {
 	tempDir, err := os.MkdirTemp("", "grill-tui-tests-")
 	if err != nil {
@@ -175,6 +185,411 @@ func TestDefaultQuitBindingsExit(t *testing.T) {
 			terminal.waitForExit(t)
 		})
 	}
+}
+
+func TestTerminalModesAreEnabledAndRestored(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "5")
+
+	started := terminal.output.String()
+	for _, sequence := range []string{"\x1b[?1049h", "\x1b[?1002h", "\x1b[?1006h"} {
+		if !strings.Contains(started, sequence) {
+			t.Fatalf("startup output does not enable terminal mode %q: %q", sequence, started)
+		}
+	}
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+	finished := terminal.output.String()
+	for _, sequence := range []string{"\x1b[?1049l", "\x1b[?1002l", "\x1b[?1006l"} {
+		if !strings.Contains(finished, sequence) {
+			t.Fatalf("exit output does not restore terminal mode %q: %q", sequence, finished)
+		}
+	}
+}
+
+func TestResizeShowsSmallTerminalStateAndRestoresWorksheet(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "5")
+	for number := 6; number <= 14; number++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, number)
+	}
+
+	mark := len(terminal.output.String())
+	terminal.resize(t, 40, 10)
+	small := terminal.waitForAfter(t, mark, "Terminal too small")
+	for _, text := range []string{"40×10", "Selected Answer Slot 14", "Worksheet data is safe", "resize"} {
+		if !strings.Contains(small, text) {
+			t.Fatalf("small-terminal state does not contain %q:\n%s", text, small)
+		}
+	}
+	smallLines := strings.Split(strings.TrimSpace(small), "\n")
+	if len(smallLines) > 10 {
+		t.Fatalf("small-terminal state uses %d rows, want at most 10:\n%s", len(smallLines), small)
+	}
+	for _, line := range smallLines {
+		if width := runewidth.StringWidth(line); width > 40 {
+			t.Fatalf("small-terminal state rendered a %d-cell line %q:\n%s", width, line, small)
+		}
+	}
+
+	mark = len(terminal.output.String())
+	terminal.resize(t, 80, 24)
+	restored := terminal.waitForAfter(t, mark, "Selected Answer 14 (full):")
+	if !strings.Contains(restored, "> 14 │") {
+		t.Fatalf("resized Worksheet did not keep the selected Answer Slot visible:\n%s", restored)
+	}
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+	resumed := startTerminal(t, workingDir)
+	resumed.waitForSelection(t, 14)
+	resumed.send(t, "q")
+	resumed.waitForExit(t)
+}
+
+func TestSmallTerminalStateDoesNotAcceptHiddenPromptInput(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir())
+	mark := len(terminal.output.String())
+	terminal.resize(t, 40, 10)
+	small := terminal.waitForAfter(t, mark, "Terminal too small")
+	if !strings.Contains(small, "No Worksheet has been created yet") {
+		t.Fatalf("small-terminal prompt state does not explain that no data exists:\n%s", small)
+	}
+
+	terminal.send(t, "7\r")
+	time.Sleep(50 * time.Millisecond)
+	mark = len(terminal.output.String())
+	terminal.resize(t, 80, 24)
+	prompt := terminal.waitForAfter(t, mark, "Starting number:")
+	if strings.Contains(prompt, "10 Answer Slots") || !strings.Contains(prompt, "Starting number: \n") {
+		t.Fatalf("hidden input changed the starting-number prompt:\n%s", prompt)
+	}
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestResizeReflowsViewportAroundSelectedAnswerSlot(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "5")
+	for number := 6; number <= 14; number++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, number)
+	}
+
+	mark := len(terminal.output.String())
+	terminal.resize(t, 80, 16)
+	compact := terminal.waitForAfter(t, mark, "Selected Answer 14 (full):")
+	assertVisibleAnswerSlotRange(t, compact, 11, 14)
+
+	mark = len(terminal.output.String())
+	terminal.resize(t, 80, 24)
+	expanded := terminal.waitForAfter(t, mark, "Selected Answer 14 (full):")
+	assertVisibleAnswerSlotRange(t, expanded, 5, 14)
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestCompactHeightKeepsSelectionVisibleAcrossNavigationCommitAndUndo(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "5")
+	terminal.resize(t, 80, 16)
+	terminal.waitFor(t, "Selected Answer 5 (full):")
+
+	for selected := 6; selected <= 8; selected++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, selected)
+	}
+	mark := len(terminal.output.String())
+	terminal.send(t, "j")
+	terminal.waitForAfter(t, mark, "Selected Answer 9 (full):")
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	terminal.waitForAfter(t, mark, "Move: ↑/↓, j/k, Ctrl-N/Ctrl-P")
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	navigated := terminal.waitForAfter(t, mark, "Selected Answer 9 (full):")
+	assertVisibleAnswerSlotRange(t, navigated, 6, 9)
+
+	terminal.send(t, "i")
+	terminal.waitFor(t, "Inline Custom Answer 9:")
+	mark = len(terminal.output.String())
+	terminal.send(t, "compact answer\r")
+	terminal.waitForAfter(t, mark, "Selected Answer 10 (full):")
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	terminal.waitForAfter(t, mark, "Move: ↑/↓, j/k, Ctrl-N/Ctrl-P")
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	committed := terminal.waitForAfter(t, mark, "Selected Answer 10 (full):")
+	assertVisibleAnswerSlotRange(t, committed, 7, 10)
+
+	mark = len(terminal.output.String())
+	terminal.send(t, "u")
+	terminal.waitForAfter(t, mark, "Undid Answer Slot 9")
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	terminal.waitForAfter(t, mark, "Move: ↑/↓, j/k, Ctrl-N/Ctrl-P")
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	undone := terminal.waitForAfter(t, mark, "Undid Answer Slot 9")
+	assertVisibleAnswerSlotRange(t, undone, 6, 9)
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestInlineCancelAfterCompactResizeKeepsSelectionVisible(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "5")
+	terminal.resize(t, 80, 17)
+	terminal.waitFor(t, "Selected Answer 5 (full):")
+	for selected := 6; selected <= 9; selected++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, selected)
+	}
+
+	terminal.send(t, "i")
+	terminal.waitFor(t, "Inline Custom Answer 9:")
+	mark := len(terminal.output.String())
+	terminal.resize(t, 80, 16)
+	terminal.waitForAfter(t, mark, "Inline Custom Answer 9:")
+	terminal.send(t, "\x1b")
+	terminal.waitFor(t, "Inline Custom Answer cancelled")
+
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	terminal.waitForAfter(t, mark, "Move: ↑/↓, j/k, Ctrl-N/Ctrl-P")
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	worksheet := terminal.waitForAfter(t, mark, "Inline Custom Answer cancelled")
+	assertVisibleAnswerSlotRange(t, worksheet, 6, 9)
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestCompactHeightBudgetsRowsForMultilinePreviewAndWrappedHelp(t *testing.T) {
+	editor := writeEditorFixture(t, filepath.Join(t.TempDir(), "multiline-editor"), `#!/bin/sh
+printf 'first line\nsecond line\nthird line' > "$1"
+`)
+	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{
+		values:  map[string]string{"VISUAL": editor},
+		removed: []string{"EDITOR"},
+	}, "5")
+	terminal.send(t, "o")
+	terminal.waitForSelection(t, 6)
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 5)
+
+	mark := len(terminal.output.String())
+	terminal.resize(t, 50, 16)
+	compact := terminal.waitForAfter(t, mark, "Selected Answer 5 (full):")
+	assertVisibleAnswerSlotRange(t, compact, 5, 5)
+	for _, line := range []string{"first line", "second line", "third line"} {
+		if !strings.Contains(compact, line) {
+			t.Fatalf("compact layout lost preview line %q:\n%s", line, compact)
+		}
+	}
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestSupportedWidthReflowsLongContentWithoutLosingPreview(t *testing.T) {
+	workingDir := t.TempDir()
+	longAnswer := "wide " + strings.Repeat("界", 30)
+	installWorksheetFixture(t, workingDir, filepath.Join("testdata", "long-answer-worksheet.json"))
+	terminal := startTerminal(t, workingDir)
+
+	mark := len(terminal.output.String())
+	terminal.resize(t, 50, 24)
+	narrow := terminal.waitForAfter(t, mark, "Selected Answer 20 (full):")
+	for _, line := range strings.Split(narrow, "\n") {
+		if width := runewidth.StringWidth(line); width > 50 {
+			t.Fatalf("50-column layout rendered a %d-cell line %q:\n%s", width, line, narrow)
+		}
+	}
+	previewAndBelow := strings.SplitN(narrow, "Selected Answer 20 (full):\n", 2)
+	if len(previewAndBelow) != 2 || !strings.Contains(strings.ReplaceAll(previewAndBelow[1], "\n", ""), longAnswer) {
+		t.Fatalf("width reflow lost part of the full selected-answer preview:\n%s", narrow)
+	}
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestMouseClickSelectsAnswerSlotAndPersistsSelection(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "5")
+
+	terminal.send(t, sgrMousePress(10, 9, 0))
+	terminal.waitForSelection(t, 8)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	resumed := startTerminal(t, workingDir)
+	resumed.waitForSelection(t, 8)
+	resumed.send(t, "q")
+	resumed.waitForExit(t)
+}
+
+func TestMouseClickSelectsVisibleAnswerSlotAtCompactHeight(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "5")
+	terminal.resize(t, 80, 16)
+	terminal.waitFor(t, "Selected Answer 5 (full):")
+	for selected := 6; selected <= 8; selected++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, selected)
+	}
+
+	terminal.send(t, sgrMousePress(10, 6, 0))
+	terminal.waitForSelection(t, 5)
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestCompactMouseSelectionRevealsSlotWithMultilinePreview(t *testing.T) {
+	editor := writeEditorFixture(t, filepath.Join(t.TempDir(), "mouse-preview-editor"), `#!/bin/sh
+printf 'first line\nsecond line\nthird line' > "$1"
+`)
+	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{
+		values:  map[string]string{"VISUAL": editor},
+		removed: []string{"EDITOR"},
+	}, "5")
+	for selected := 6; selected <= 8; selected++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, selected)
+	}
+	terminal.send(t, "o")
+	terminal.waitForSelection(t, 9)
+	for selected := 8; selected >= 5; selected-- {
+		terminal.send(t, "k")
+		terminal.waitForSelection(t, selected)
+	}
+
+	terminal.resize(t, 80, 16)
+	terminal.waitFor(t, "Selected Answer 5 (full):")
+	terminal.send(t, sgrMousePress(10, 9, 0))
+	terminal.waitForSelection(t, 8)
+
+	mark := len(terminal.output.String())
+	terminal.send(t, "?")
+	terminal.waitForAfter(t, mark, "Move: ↑/↓, j/k, Ctrl-N/Ctrl-P")
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	worksheet := terminal.waitForAfter(t, mark, "Selected Answer 8 (full):")
+	assertVisibleAnswerSlotRange(t, worksheet, 7, 8)
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestMouseWheelScrollsWorksheetWithoutChangingSelection(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "5")
+	for selected := 6; selected <= 15; selected++ {
+		terminal.send(t, "r")
+		terminal.waitForSelection(t, selected)
+	}
+
+	mark := len(terminal.output.String())
+	terminal.send(t, sgrMousePress(10, 10, 64))
+	scrolledUp := terminal.waitForAfter(t, mark, "Worksheet scrolled")
+	assertVisibleAnswerSlotRange(t, scrolledUp, 5, 14)
+
+	mark = len(terminal.output.String())
+	terminal.send(t, sgrMousePress(10, 10, 65))
+	scrolledDown := terminal.waitForAfter(t, mark, "> 15 │")
+	assertVisibleAnswerSlotRange(t, scrolledDown, 6, 15)
+
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 14)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestHelpOverlayListsEveryCurrentBindingAndLeavesWorksheetUnchanged(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "5")
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 6)
+
+	mark := len(terminal.output.String())
+	terminal.send(t, "?")
+	help := terminal.waitForAfter(t, mark, "Complete Help")
+	for _, text := range completeHelpBindingDescriptions {
+		if !strings.Contains(help, text) {
+			t.Fatalf("complete help does not contain %q:\n%s", text, help)
+		}
+	}
+	if strings.Contains(help, "layout variant") || strings.Contains(help, "[/]") {
+		t.Fatalf("complete help exposes prototype-only layout bindings:\n%s", help)
+	}
+
+	terminal.send(t, "r")
+	time.Sleep(50 * time.Millisecond)
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	worksheet := terminal.waitForAfter(t, mark, "Selected Answer 6 (full):")
+	if !regexp.MustCompile(`(?m)^> 6 │ $`).MatchString(worksheet) {
+		t.Fatalf("closing help did not return to the unchanged Worksheet:\n%s", worksheet)
+	}
+	if !strings.Contains(worksheet, "? help") || !strings.Contains(worksheet, "Status:") {
+		t.Fatalf("normal view is missing compact help or status:\n%s", worksheet)
+	}
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestCompleteHelpFitsMinimumSupportedTerminal(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "5")
+	terminal.resize(t, 50, 15)
+	terminal.waitFor(t, "Selected Answer 5 (full):")
+
+	mark := len(terminal.output.String())
+	terminal.send(t, "?")
+	help := terminal.waitForAfter(t, mark, "Help: ?; Quit: q, Ctrl-Q, Ctrl-C")
+	for _, line := range strings.Split(help, "\n") {
+		if width := runewidth.StringWidth(line); width > 50 {
+			t.Fatalf("minimum-size help rendered a %d-cell line %q:\n%s", width, line, help)
+		}
+	}
+	for _, text := range completeHelpBindingDescriptions {
+		if !strings.Contains(help, text) {
+			t.Fatalf("minimum-size help does not contain %q:\n%s", text, help)
+		}
+	}
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestNoColorDisablesPresentationColorWithoutRemovingCues(t *testing.T) {
+	colored := startTerminalWithEnv(t, t.TempDir(), []string{"NO_COLOR="}, "5")
+	if !sgrColorPattern.MatchString(colored.output.String()) {
+		t.Fatalf("normal presentation did not use color for emphasis: %q", colored.output.String())
+	}
+	colored.send(t, "q")
+	colored.waitForExit(t)
+
+	colorFree := startTerminal(t, t.TempDir(), "5")
+	raw := colorFree.output.String()
+	if sgrColorPattern.MatchString(raw) {
+		t.Fatalf("NO_COLOR presentation contains color styling: %q", raw)
+	}
+	screen := cleanTerminalOutput(raw)
+	for _, cue := range []string{"> 5 │", "Selected Answer 5", "Status: Worksheet ready", "? help"} {
+		if !strings.Contains(screen, cue) {
+			t.Fatalf("NO_COLOR presentation lost %q cue:\n%s", cue, screen)
+		}
+	}
+	colorFree.send(t, "q")
+	colorFree.waitForExit(t)
+}
+
+func sgrMousePress(x, y, button int) string {
+	return fmt.Sprintf("\x1b[<%d;%d;%dM", button, x, y)
 }
 
 func TestJKMovesSelectionAndStopsAtWorksheetBoundaries(t *testing.T) {
@@ -985,7 +1400,7 @@ func TestClipboardWriteFailureFallsBackToNextEnvironmentBackend(t *testing.T) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		t.Fatalf("create persisted Worksheet directory: %v", err)
 	}
-	fixture := fmt.Sprintf(`{"slots":[{"number":1,"answer":"%s"}],"selected":0,"viewport":0}`, largeAnswer)
+	fixture := fmt.Sprintf(`{"slots":[{"number":1,"answer":"%s"},{"number":2,"answer":""}],"selected":1,"viewport":0}`, largeAnswer)
 	if err := os.WriteFile(filepath.Join(directory, "worksheet.json"), []byte(fixture), 0o600); err != nil {
 		t.Fatalf("write persisted Worksheet: %v", err)
 	}
@@ -1232,6 +1647,16 @@ func (buffer *synchronizedBuffer) String() string {
 	return buffer.buffer.String()
 }
 
+func (buffer *synchronizedBuffer) StringFrom(offset int) string {
+	buffer.mutex.Lock()
+	defer buffer.mutex.Unlock()
+	contents := buffer.buffer.String()
+	if offset > len(contents) {
+		return ""
+	}
+	return contents[offset:]
+}
+
 func startTerminal(t *testing.T, workingDir string, args ...string) *testTerminal {
 	return startTerminalWithEnvironment(t, workingDir, environmentOverrides{}, args...)
 }
@@ -1261,7 +1686,9 @@ func startTerminalWithEnvironment(t *testing.T, workingDir string, overrides env
 	if _, overridden := overrides.values["TERM"]; !overridden {
 		environment["TERM"] = "xterm-256color"
 	}
-	environment["NO_COLOR"] = "1"
+	if _, overridden := overrides.values["NO_COLOR"]; !overridden {
+		environment["NO_COLOR"] = "1"
+	}
 	cmd.Env = make([]string, 0, len(environment))
 	for name, value := range environment {
 		cmd.Env = append(cmd.Env, name+"="+value)
@@ -1319,6 +1746,19 @@ func startTerminalWithEnvironment(t *testing.T, workingDir string, overrides env
 	return terminal
 }
 
+func startTerminalWithEnv(t *testing.T, workingDir string, environment []string, args ...string) *testTerminal {
+	t.Helper()
+	values := make(map[string]string, len(environment))
+	for _, entry := range environment {
+		name, value, found := strings.Cut(entry, "=")
+		if !found {
+			t.Fatalf("environment override %q is not NAME=value", entry)
+		}
+		values[name] = value
+	}
+	return startTerminalWithEnvironment(t, workingDir, environmentOverrides{values: values}, args...)
+}
+
 func (terminal *testTerminal) send(t *testing.T, input string) {
 	t.Helper()
 	if _, err := terminal.pty.WriteString(input); err != nil {
@@ -1326,11 +1766,18 @@ func (terminal *testTerminal) send(t *testing.T, input string) {
 	}
 }
 
-func (terminal *testTerminal) waitFor(t *testing.T, text string) string {
+func (terminal *testTerminal) resize(t *testing.T, width, height uint16) {
+	t.Helper()
+	if err := pty.Setsize(terminal.pty, &pty.Winsize{Rows: height, Cols: width}); err != nil {
+		t.Fatalf("resize PTY to %d×%d: %v", width, height, err)
+	}
+}
+
+func (terminal *testTerminal) waitForAfter(t *testing.T, offset int, text string) string {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		output := cleanTerminalOutput(terminal.output.String())
+		output := cleanTerminalOutput(terminal.output.StringFrom(offset))
 		if strings.Contains(output, text) {
 			return output
 		}
@@ -1341,8 +1788,13 @@ func (terminal *testTerminal) waitFor(t *testing.T, text string) string {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %q; output:\n%s", text, cleanTerminalOutput(terminal.output.String()))
+	t.Fatalf("timed out waiting for %q; output:\n%s", text, cleanTerminalOutput(terminal.output.StringFrom(offset)))
 	return ""
+}
+
+func (terminal *testTerminal) waitFor(t *testing.T, text string) string {
+	t.Helper()
+	return terminal.waitForAfter(t, 0, text)
 }
 
 func (terminal *testTerminal) waitForSelection(t *testing.T, number int) string {
@@ -1379,6 +1831,7 @@ func (terminal *testTerminal) waitForExit(t *testing.T) {
 }
 
 var ansiSequence = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[()][0-2A-Z])`)
+var sgrColorPattern = regexp.MustCompile(`\x1b\[(?:3[0-7]|38;)[0-9;]*m`)
 var answerSlotLinePattern = regexp.MustCompile(`(?m)^[ >] ([0-9]+) │`)
 var selectedAnswerSlotPattern = regexp.MustCompile(`(?m)^> ([0-9]+) │`)
 

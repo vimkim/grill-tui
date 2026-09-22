@@ -22,10 +22,16 @@ func run(args []string) error {
 		return fmt.Errorf("provide at most one positive starting number")
 	}
 
-	initialModel := worksheetModel{mode: startingNumberMode}
+	useColor := os.Getenv("NO_COLOR") == ""
+	initialModel := worksheetModel{
+		mode:     startingNumberMode,
+		size:     defaultTerminalSize,
+		useColor: useColor,
+	}
 	existing, err := loadWorksheet()
 	if err == nil {
-		initialModel = worksheetModel{worksheet: existing}
+		initialModel.mode = normalMode
+		initialModel.worksheet = existing
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	} else if len(args) == 1 {
@@ -33,13 +39,14 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		initialModel = worksheetModel{worksheet: newWorksheet(start)}
+		initialModel.mode = normalMode
+		initialModel.worksheet = newWorksheet(start)
 		if err := saveWorksheet(initialModel.worksheet); err != nil {
 			return err
 		}
 	}
 
-	program := tea.NewProgram(initialModel, tea.WithAltScreen())
+	program := tea.NewProgram(initialModel, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err = program.Run()
 	return err
 }

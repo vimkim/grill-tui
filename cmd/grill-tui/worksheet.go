@@ -53,11 +53,19 @@ func (storedWorksheet worksheet) answerList() string {
 }
 
 func (storedWorksheet *worksheet) revealSelection() {
+	storedWorksheet.revealSelectionWithin(visibleAnswerSlotCount)
+}
+
+func (storedWorksheet *worksheet) revealSelectionWithin(visibleCount int) {
+	maximumViewport := max(0, len(storedWorksheet.Slots)-visibleCount)
+	if storedWorksheet.Viewport > maximumViewport {
+		storedWorksheet.Viewport = maximumViewport
+	}
 	if storedWorksheet.Selected < storedWorksheet.Viewport {
 		storedWorksheet.Viewport = storedWorksheet.Selected
 	}
-	if storedWorksheet.Selected >= storedWorksheet.Viewport+visibleAnswerSlotCount {
-		storedWorksheet.Viewport = storedWorksheet.Selected - visibleAnswerSlotCount + 1
+	if storedWorksheet.Selected >= storedWorksheet.Viewport+visibleCount {
+		storedWorksheet.Viewport = storedWorksheet.Selected - visibleCount + 1
 	}
 }
 
