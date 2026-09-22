@@ -1,7 +1,7 @@
 # grill-tui
 
-A terminal worksheet for answering a long run of numbered questions quickly, then pasting
-the whole set back into the conversation that asked them.
+A Linux terminal worksheet for answering a long run of numbered questions quickly, then
+pasting the whole set back into the conversation that asked them.
 
 When an AI grills you with twenty numbered questions, answering them in the chat box is
 miserable. You lose your place, you retype the same three answers, and the numbering drifts.
@@ -10,7 +10,7 @@ single key that copies every answer you gave, correctly numbered, straight to yo
 
 ## Install
 
-If you just want the tool:
+Install the latest tagged release with standard Go tooling:
 
 ```sh
 go install github.com/vimkim/grill-tui/cmd/grill-tui@latest
@@ -65,6 +65,7 @@ long interview never runs out of room.
 | `Esc` | Clear the selected answer |
 | `u` | Undo the last change |
 | `s` or `Ctrl-S` | Copy every answer to the clipboard |
+| `Ctrl-R` twice within two seconds | Reset the Worksheet |
 | `?` | Full help |
 | `q`, `Ctrl-Q`, `Ctrl-C` | Quit |
 
@@ -89,16 +90,26 @@ on X11 `xclip` or `xsel`. If none of those are available, which is the normal si
 SSH, it falls back to OSC 52 and asks the terminal itself to take the text. The status line
 names whichever one worked.
 
-## Your editor
+## Custom answers
 
-`o` opens the selected answer in your editor, which is `$VISUAL` if set and `$EDITOR`
-otherwise. Save and quit to commit the answer. The value is treated as a single executable
-path, so if you need flags, point it at a small wrapper script.
+Press `i` to edit the selected Answer Slot on one line. `Enter` commits and advances; `Esc`
+cancels the draft without changing the answer.
+
+Press `o` to open the current answer in your editor, which is `$VISUAL` if set and `$EDITOR`
+otherwise. Save and exit successfully to commit and advance. An editor error leaves the Answer
+Slot unchanged. The configured value is treated as a single executable path, so if you need
+flags, point it at a small wrapper script.
 
 ## Where things are kept
 
-Answers live in `.grill-tui/worksheet.json`, in the directory you ran the tool from, written
-so only you can read it. Delete that directory to start over.
+Answers, selection, and viewport live in `.grill-tui/worksheet.json` in the directory where you
+started the tool. A last-known-good copy is kept in `.grill-tui/worksheet.backup.json`; corrupt
+primary state is preserved if recovery is needed. The directory contains its own `.gitignore`,
+uses owner-only permissions, and is protected by a single-writer lock.
+
+To start over safely, press `Ctrl-R` twice within two seconds. The first press only arms reset;
+any other key or expiry cancels it. Confirmation removes both primary and backup state and
+returns to the starting-number prompt.
 
 Colors are used where the terminal supports them. Set `NO_COLOR` to turn them off.
 
@@ -130,6 +141,18 @@ Help always shows the effective bindings, including actions intentionally set to
 `quit` may omit `ctrl+c`, but it cannot be empty. `copy` must retain at least one route
 other than `ctrl+s`, since some terminals intercept that control key.
 
+## V1 platform boundary
+
+V1 supports Linux terminals, including Linux under WSL in Windows Terminal, Wayland, X11, SSH,
+and tmux. Native Windows and macOS are not supported. The program does not connect to an AI
+service, migrate unsupported Worksheet schemas, or ship through packaging systems other than
+`go install`.
+
+Maintainers use the [manual V1 compatibility checklist](docs/release-checklist.md) for the real
+terminal behavior that headless CI cannot reproduce reliably. The interaction prototype on
+branch `prototype/worksheet-interaction` at `22db4db`, with evaluation at `136e94a`, is design
+evidence only; its code and layout-switch controls are not part of production.
+
 ## Development
 
 The project uses [just](https://github.com/casey/just):
@@ -140,7 +163,14 @@ just run 12    # run from source, with an optional starting number
 just check     # formatting, vet, and the full test suite
 just build     # build into .tmp/
 just install   # install from this source tree
+just smoke-install # install into an isolated GOBIN and exercise that binary
 ```
 
 `just check` is the gate to run before pushing. The test suite drives the real binary
 through a pseudo-terminal, so it exercises the keys as a terminal actually delivers them.
+GitHub Actions runs the same formatting, vet, test, and installed-command gates from a clean
+checkout.
+
+## License
+
+grill-tui is available under the [MIT License](LICENSE).

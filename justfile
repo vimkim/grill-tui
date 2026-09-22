@@ -31,6 +31,10 @@ install:
     go install ./cmd/grill-tui
     @destination="$(go env GOBIN)"; if [ -z "$destination" ]; then destination="$(go env GOPATH)/bin"; fi; echo "installed grill-tui to $destination"
 
+# Install into an isolated GOBIN and exercise the installed command
+smoke-install:
+    ./scripts/smoke-install.sh
+
 # Remove build artifacts
 clean:
     rm -rf .tmp
