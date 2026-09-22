@@ -26,6 +26,13 @@ type answerSlot struct {
 }
 
 type worksheet struct {
+	Slots    []answerSlot   `json:"slots"`
+	Selected int            `json:"selected"`
+	Viewport int            `json:"viewport"`
+	Undo     *worksheetUndo `json:"undo,omitempty"`
+}
+
+type worksheetUndo struct {
 	Slots    []answerSlot `json:"slots"`
 	Selected int          `json:"selected"`
 	Viewport int          `json:"viewport"`
@@ -51,6 +58,7 @@ func (storedWorksheet worksheet) withSelection(change int) (worksheet, bool) {
 }
 
 func (storedWorksheet worksheet) withCommittedAnswer(answer string) (worksheet, error) {
+	storedWorksheet.Undo = storedWorksheet.undoSnapshot()
 	storedWorksheet.Slots = append([]answerSlot(nil), storedWorksheet.Slots...)
 	storedWorksheet.Slots[storedWorksheet.Selected].Answer = answer
 	if storedWorksheet.Selected == len(storedWorksheet.Slots)-1 {
@@ -64,6 +72,31 @@ func (storedWorksheet worksheet) withCommittedAnswer(answer string) (worksheet, 
 	storedWorksheet.Selected++
 	storedWorksheet.revealSelection()
 	return storedWorksheet, nil
+}
+
+func (storedWorksheet worksheet) withClearedAnswer() worksheet {
+	storedWorksheet.Undo = storedWorksheet.undoSnapshot()
+	storedWorksheet.Slots = append([]answerSlot(nil), storedWorksheet.Slots...)
+	storedWorksheet.Slots[storedWorksheet.Selected].Answer = ""
+	return storedWorksheet
+}
+
+func (storedWorksheet worksheet) undoSnapshot() *worksheetUndo {
+	return &worksheetUndo{
+		Slots:    append([]answerSlot(nil), storedWorksheet.Slots...),
+		Selected: storedWorksheet.Selected,
+		Viewport: storedWorksheet.Viewport,
+	}
+}
+
+func (storedWorksheet worksheet) withUndo() (worksheet, int) {
+	undo := storedWorksheet.Undo
+	number := undo.Slots[undo.Selected].Number
+	return worksheet{
+		Slots:    append([]answerSlot(nil), undo.Slots...),
+		Selected: undo.Selected,
+		Viewport: undo.Viewport,
+	}, number
 }
 
 func newWorksheet(start int) worksheet {

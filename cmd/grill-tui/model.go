@@ -121,6 +121,21 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return model, nil
 		}
 		switch key.String() {
+		case "esc":
+			selected := model.worksheet.Slots[model.worksheet.Selected]
+			if selected.Answer == "" {
+				model.status = fmt.Sprintf("Answer Slot %d is already empty", selected.Number)
+				return model, nil
+			}
+			candidate := model.worksheet.withClearedAnswer()
+			return model.persistWorksheet(candidate, fmt.Sprintf("Answer Slot %d cleared", selected.Number)), nil
+		case "u":
+			if model.worksheet.Undo == nil {
+				model.status = "Nothing to undo"
+				return model, nil
+			}
+			candidate, number := model.worksheet.withUndo()
+			return model.persistWorksheet(candidate, fmt.Sprintf("Undid Answer Slot %d", number)), nil
 		case "i":
 			model.mode = inlineAnswerMode
 			model.editInput = model.worksheet.Slots[model.worksheet.Selected].Answer
@@ -282,7 +297,7 @@ func (model worksheetModel) worksheetView() string {
 	}
 	fmt.Fprintf(&view, "\nStatus: %s\n", status)
 	view.WriteString("Help: ↑/↓ j/k Ctrl-N/Ctrl-P move • Space skip • q quit\n")
-	view.WriteString("Answers: r/y/n 1-5 a-e x preset • i inline • o editor\n")
+	view.WriteString("Answers: r/y/n 1-5 a-e x preset • i inline • o editor • Esc clear • u undo\n")
 	return view.String()
 }
 

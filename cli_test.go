@@ -338,6 +338,166 @@ func TestInlineCustomAnswerIsSeededAndEscapeCancelsWithoutChangingAnswer(t *test
 	terminal.waitForExit(t)
 }
 
+func TestNormalModeEscapeClearsSelectedAnswerAndPersists(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "30")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 31)
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 30)
+
+	terminal.send(t, "\x1b")
+	screen := terminal.waitFor(t, "Answer Slot 30 cleared")
+	if answer := latestRenderedAnswer(t, screen, 30); answer != "" {
+		t.Fatalf("cleared Answer Slot contains %q, want empty:\n%s", answer, screen)
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	resumed := startTerminal(t, workingDir)
+	screen = resumed.waitForSelection(t, 30)
+	if answer := latestRenderedAnswer(t, screen, 30); answer != "" {
+		t.Fatalf("cleared Answer Slot contains %q after restart, want empty:\n%s", answer, screen)
+	}
+	resumed.send(t, "q")
+	resumed.waitForExit(t)
+}
+
+func TestUndoWithNoCommittedMutationLeavesWorksheetUnchanged(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "30")
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 31)
+
+	terminal.send(t, "u")
+	screen := terminal.waitFor(t, "Nothing to undo")
+	if answer := latestRenderedAnswer(t, screen, 31); answer != "" {
+		t.Fatalf("empty undo changed Answer Slot 31 to %q:\n%s", answer, screen)
+	}
+	if selections := selectedAnswerSlotPattern.FindAllStringSubmatch(screen, -1); selections[len(selections)-1][1] != "31" {
+		t.Fatalf("empty undo moved selection away from Answer Slot 31:\n%s", screen)
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestUndoPresetCommitAfterNavigationAndRestartRestoresAffectedSlot(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "30")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 31)
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 32)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	resumed := startTerminal(t, workingDir)
+	resumed.waitForSelection(t, 32)
+	assertUndoRestoresAnswer(t, resumed, 30, "")
+
+	resumed.send(t, "u")
+	resumed.waitFor(t, "Nothing to undo")
+	resumed.send(t, "q")
+	resumed.waitForExit(t)
+}
+
+func TestUndoInlineCommitRestoresAffectedSlot(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "30")
+	terminal.send(t, "i")
+	terminal.waitFor(t, "Inline Custom Answer 30:")
+	terminal.send(t, "custom answer\r")
+	terminal.waitForSelection(t, 31)
+
+	assertUndoRestoresAnswer(t, terminal, 30, "")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestUndoExternalEditorCommitRestoresAffectedSlot(t *testing.T) {
+	editor := writeEditorFixture(t, filepath.Join(t.TempDir(), "editor"), `#!/bin/sh
+printf 'external answer' > "$1"
+`)
+	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{
+		values:  map[string]string{"VISUAL": editor},
+		removed: []string{"EDITOR"},
+	}, "30")
+	terminal.send(t, "o")
+	terminal.waitForSelection(t, 31)
+
+	assertUndoRestoresAnswer(t, terminal, 30, "")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestUndoClearRestoresClearedAnswer(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "30")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 31)
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 30)
+	terminal.send(t, "\x1b")
+	terminal.waitFor(t, "Answer Slot 30 cleared")
+
+	assertUndoRestoresAnswer(t, terminal, 30, "recommended")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestClearingEmptySlotDoesNotReplaceAvailableUndo(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "30")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 31)
+
+	terminal.send(t, "\x1b")
+	terminal.waitFor(t, "Answer Slot 31 is already empty")
+	assertUndoRestoresAnswer(t, terminal, 30, "")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestUndoReplacementRestoresPreviousAnswer(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "30")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 31)
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 30)
+	terminal.send(t, "y")
+	terminal.waitForSelection(t, 31)
+
+	assertUndoRestoresAnswer(t, terminal, 30, "recommended")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestUndoFinalSlotCommitRemovesAppendedSlot(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "30")
+	for selected := 31; selected <= 39; selected++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, selected)
+	}
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 40)
+	terminal.waitFor(t, "11 Answer Slots")
+
+	terminal.send(t, "u")
+	terminal.waitFor(t, "Undid Answer Slot 39")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	resumed := startTerminal(t, workingDir)
+	screen := resumed.waitForSelection(t, 39)
+	if !strings.Contains(screen, "10 Answer Slots") {
+		t.Fatalf("undo did not remove the appended Answer Slot:\n%s", screen)
+	}
+	if answer := latestRenderedAnswer(t, screen, 39); answer != "" {
+		t.Fatalf("undo restored Answer Slot 39 to %q, want empty:\n%s", answer, screen)
+	}
+	resumed.send(t, "u")
+	resumed.waitFor(t, "Nothing to undo")
+	resumed.send(t, "q")
+	resumed.waitForExit(t)
+}
+
 func TestInlineCustomAnswerCommitAutoAdvancesGrowsAndSurvivesResume(t *testing.T) {
 	workingDir := t.TempDir()
 	terminal := startTerminal(t, workingDir, "90")
@@ -600,6 +760,29 @@ func assertVisibleAnswerSlotRange(t *testing.T, screen string, first, last int) 
 	slots := answerSlotLinePattern.FindAllStringSubmatch(screen, -1)
 	if len(slots) != last-first+1 || slots[0][1] != fmt.Sprintf("%d", first) || slots[len(slots)-1][1] != fmt.Sprintf("%d", last) {
 		t.Fatalf("visible Answer Slots do not span %d through %d:\n%s", first, last, screen)
+	}
+}
+
+func latestRenderedAnswer(t *testing.T, screen string, number int) string {
+	t.Helper()
+	pattern := regexp.MustCompile(fmt.Sprintf(`(?m)^[ >] %d │(.*)$`, number))
+	matches := pattern.FindAllStringSubmatch(screen, -1)
+	if len(matches) == 0 {
+		t.Fatalf("Answer Slot %d is missing from rendered output:\n%s", number, screen)
+	}
+	return strings.TrimPrefix(matches[len(matches)-1][1], " ")
+}
+
+func assertUndoRestoresAnswer(t *testing.T, terminal *testTerminal, number int, wantAnswer string) {
+	t.Helper()
+	terminal.send(t, "u")
+	screen := terminal.waitFor(t, fmt.Sprintf("Undid Answer Slot %d", number))
+	if answer := latestRenderedAnswer(t, screen, number); answer != wantAnswer {
+		t.Fatalf("undo restored Answer Slot %d to %q, want %q:\n%s", number, answer, wantAnswer, screen)
+	}
+	selections := selectedAnswerSlotPattern.FindAllStringSubmatch(screen, -1)
+	if selections[len(selections)-1][1] != fmt.Sprintf("%d", number) {
+		t.Fatalf("undo did not return selection to Answer Slot %d:\n%s", number, screen)
 	}
 }
 
