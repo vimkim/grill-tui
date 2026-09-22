@@ -9,11 +9,15 @@ import (
 	"strconv"
 )
 
-const initialAnswerSlotCount = 10
+const (
+	initialAnswerSlotCount = 10
+	visibleAnswerSlotCount = 10
+)
 
 var (
-	errInvalidStartingNumber  = errors.New("starting number must be a positive integer")
-	errStartingNumberTooLarge = errors.New("starting number is too large for ten consecutive Answer Slots")
+	errInvalidStartingNumber    = errors.New("starting number must be a positive integer")
+	errStartingNumberTooLarge   = errors.New("starting number is too large for ten consecutive Answer Slots")
+	errAnswerSlotNumberTooLarge = errors.New("next Answer Slot number is too large")
 )
 
 type answerSlot struct {
@@ -22,7 +26,44 @@ type answerSlot struct {
 }
 
 type worksheet struct {
-	Slots []answerSlot `json:"slots"`
+	Slots    []answerSlot `json:"slots"`
+	Selected int          `json:"selected"`
+	Viewport int          `json:"viewport"`
+}
+
+func (storedWorksheet *worksheet) revealSelection() {
+	if storedWorksheet.Selected < storedWorksheet.Viewport {
+		storedWorksheet.Viewport = storedWorksheet.Selected
+	}
+	if storedWorksheet.Selected >= storedWorksheet.Viewport+visibleAnswerSlotCount {
+		storedWorksheet.Viewport = storedWorksheet.Selected - visibleAnswerSlotCount + 1
+	}
+}
+
+func (storedWorksheet worksheet) withSelection(change int) (worksheet, bool) {
+	selected := storedWorksheet.Selected + change
+	if selected < 0 || selected >= len(storedWorksheet.Slots) {
+		return storedWorksheet, false
+	}
+	storedWorksheet.Selected = selected
+	storedWorksheet.revealSelection()
+	return storedWorksheet, true
+}
+
+func (storedWorksheet worksheet) withCommittedAnswer(answer string) (worksheet, error) {
+	storedWorksheet.Slots = append([]answerSlot(nil), storedWorksheet.Slots...)
+	storedWorksheet.Slots[storedWorksheet.Selected].Answer = answer
+	if storedWorksheet.Selected == len(storedWorksheet.Slots)-1 {
+		lastNumber := storedWorksheet.Slots[storedWorksheet.Selected].Number
+		maxInt := int(^uint(0) >> 1)
+		if lastNumber == maxInt {
+			return worksheet{}, errAnswerSlotNumberTooLarge
+		}
+		storedWorksheet.Slots = append(storedWorksheet.Slots, answerSlot{Number: lastNumber + 1})
+	}
+	storedWorksheet.Selected++
+	storedWorksheet.revealSelection()
+	return storedWorksheet, nil
 }
 
 func newWorksheet(start int) worksheet {

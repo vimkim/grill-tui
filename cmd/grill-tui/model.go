@@ -6,7 +6,10 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 )
+
+const gridAnswerWidth = 40
 
 type worksheetModel struct {
 	worksheet  worksheet
@@ -68,8 +71,64 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			model.status = "Starting number must contain digits only. Try again."
 			return model, nil
 		}
+		switch key.String() {
+		case "j", "down", "ctrl+n", " ":
+			return model.moveSelection(1), nil
+		case "k", "up", "ctrl+p":
+			return model.moveSelection(-1), nil
+		}
+		if answer, ok := presetAnswerForKey(key.String()); ok {
+			return model.commitAnswer(string(answer), "Preset Answer committed"), nil
+		}
+		if key.String() == "x" {
+			return model.commitAnswer("explain further", "Answer committed"), nil
+		}
 	}
 	return model, nil
+}
+
+type presetAnswer string
+
+func presetAnswerForKey(key string) (presetAnswer, bool) {
+	switch key {
+	case "r", "R":
+		return presetAnswer("recommended"), true
+	case "y", "Y":
+		return presetAnswer("yes"), true
+	case "n", "N":
+		return presetAnswer("no"), true
+	case "1", "2", "3", "4", "5", "a", "b", "c", "d", "e", "A", "B", "C", "D", "E":
+		return presetAnswer(key), true
+	default:
+		return "", false
+	}
+}
+
+func (model worksheetModel) commitAnswer(answer, successStatus string) worksheetModel {
+	candidate, err := model.worksheet.withCommittedAnswer(answer)
+	if err != nil {
+		model.status = fmt.Sprintf("Could not grow Worksheet: %v", err)
+		return model
+	}
+	return model.persistWorksheet(candidate, successStatus)
+}
+
+func (model worksheetModel) moveSelection(change int) worksheetModel {
+	candidate, moved := model.worksheet.withSelection(change)
+	if !moved {
+		return model
+	}
+	return model.persistWorksheet(candidate, "Selection moved")
+}
+
+func (model worksheetModel) persistWorksheet(candidate worksheet, successStatus string) worksheetModel {
+	if err := saveWorksheet(candidate); err != nil {
+		model.status = fmt.Sprintf("Could not save Worksheet: %v", err)
+		return model
+	}
+	model.worksheet = candidate
+	model.status = successStatus
+	return model
 }
 
 func (model worksheetModel) View() string {
@@ -94,21 +153,34 @@ func (model worksheetModel) promptView() string {
 func (model worksheetModel) worksheetView() string {
 	var view strings.Builder
 	view.WriteString("Grill TUI — Worksheet\n\n")
-	view.WriteString("10 Answer Slots\n")
+	fmt.Fprintf(&view, "%d Answer Slots\n", len(model.worksheet.Slots))
 	view.WriteString("   No. │ Answer\n")
 	view.WriteString("───────┼────────────────────────────────────────\n")
-	for index, slot := range model.worksheet.Slots {
+	lastVisible := min(model.worksheet.Viewport+visibleAnswerSlotCount, len(model.worksheet.Slots))
+	for index := model.worksheet.Viewport; index < lastVisible; index++ {
+		slot := model.worksheet.Slots[index]
 		marker := " "
-		if index == 0 {
+		if index == model.worksheet.Selected {
 			marker = ">"
 		}
-		fmt.Fprintf(&view, "%s %d │ %s\n", marker, slot.Number, slot.Answer)
+		fmt.Fprintf(&view, "%s %d │ %s\n", marker, slot.Number, truncateGridAnswer(slot.Answer))
 	}
+	selected := model.worksheet.Slots[model.worksheet.Selected]
+	preview := selected.Answer
+	if preview == "" {
+		preview = "(empty)"
+	}
+	fmt.Fprintf(&view, "\nSelected Answer %d (full):\n%s\n", selected.Number, preview)
 	status := model.status
 	if status == "" {
 		status = "Worksheet ready"
 	}
 	fmt.Fprintf(&view, "\nStatus: %s\n", status)
-	view.WriteString("Help: q / Ctrl-Q / Ctrl-C quit\n")
+	view.WriteString("Help: ↑/↓ j/k Ctrl-N/Ctrl-P move • Space skip • r/y/n 1-5 a-e x answer • q quit\n")
 	return view.String()
+}
+
+func truncateGridAnswer(answer string) string {
+	answer = strings.ReplaceAll(answer, "\n", " ")
+	return runewidth.Truncate(answer, gridAnswerWidth, "…")
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/mattn/go-runewidth"
 )
 
 var grillTUIBinary string
@@ -171,6 +172,255 @@ func TestDefaultQuitBindingsExit(t *testing.T) {
 	}
 }
 
+func TestJKMovesSelectionAndStopsAtWorksheetBoundaries(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "5")
+
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 6)
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 5)
+
+	terminal.send(t, "k")
+	time.Sleep(50 * time.Millisecond)
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 6)
+	for number := 7; number <= 14; number++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, number)
+	}
+	terminal.send(t, "j")
+	time.Sleep(50 * time.Millisecond)
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 13)
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestDefaultNavigationFamiliesMoveSelection(t *testing.T) {
+	tests := []struct {
+		name     string
+		next     string
+		previous string
+	}{
+		{name: "arrow keys", next: "\x1b[B", previous: "\x1b[A"},
+		{name: "control keys", next: "\x0e", previous: "\x10"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			terminal := startTerminal(t, t.TempDir(), "8")
+			terminal.send(t, test.next)
+			terminal.waitForSelection(t, 9)
+			terminal.send(t, test.previous)
+			terminal.waitForSelection(t, 8)
+			terminal.send(t, "q")
+			terminal.waitForExit(t)
+		})
+	}
+}
+
+func TestSpaceAdvancesWithoutEditingOrGrowingWorksheet(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "8")
+
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 9)
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 8)
+	terminal.send(t, " ")
+	terminal.waitForSelection(t, 9)
+	for number := 10; number <= 17; number++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, number)
+	}
+	terminal.send(t, " ")
+	time.Sleep(50 * time.Millisecond)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	resumed := startTerminal(t, workingDir)
+	resumed.waitForSelection(t, 17)
+	resumed.send(t, "q")
+	resumed.waitForExit(t)
+	screen := cleanTerminalOutput(resumed.output.String())
+	if slots := answerSlotLinePattern.FindAllStringSubmatch(screen, -1); len(slots) != 10 {
+		t.Fatalf("Space at the final Answer Slot rendered %d slots, want 10:\n%s", len(slots), screen)
+	}
+	if !regexp.MustCompile(`(?m)^> 17 │ $`).MatchString(screen) {
+		t.Fatalf("Space changed the selected Answer Slot instead of leaving it empty:\n%s", screen)
+	}
+	if !strings.Contains(screen, "  8 │ recommended") {
+		t.Fatalf("Space changed the existing answer instead of preserving it:\n%s", screen)
+	}
+}
+
+func TestPresetAnswerFamiliesCommitExactValuesAndAutoAdvance(t *testing.T) {
+	tests := []struct {
+		name   string
+		key    string
+		answer string
+	}{
+		{name: "lowercase recommended", key: "r", answer: "recommended"},
+		{name: "uppercase recommended", key: "R", answer: "recommended"},
+		{name: "lowercase yes", key: "y", answer: "yes"},
+		{name: "uppercase yes", key: "Y", answer: "yes"},
+		{name: "lowercase no", key: "n", answer: "no"},
+		{name: "uppercase no", key: "N", answer: "no"},
+		{name: "digit 1", key: "1", answer: "1"},
+		{name: "digit 2", key: "2", answer: "2"},
+		{name: "digit 3", key: "3", answer: "3"},
+		{name: "digit 4", key: "4", answer: "4"},
+		{name: "digit 5", key: "5", answer: "5"},
+		{name: "lowercase a", key: "a", answer: "a"},
+		{name: "lowercase b", key: "b", answer: "b"},
+		{name: "lowercase c", key: "c", answer: "c"},
+		{name: "lowercase d", key: "d", answer: "d"},
+		{name: "lowercase e", key: "e", answer: "e"},
+		{name: "uppercase A", key: "A", answer: "A"},
+		{name: "uppercase B", key: "B", answer: "B"},
+		{name: "uppercase C", key: "C", answer: "C"},
+		{name: "uppercase D", key: "D", answer: "D"},
+		{name: "uppercase E", key: "E", answer: "E"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			terminal := startTerminal(t, t.TempDir(), "30")
+			terminal.send(t, test.key)
+			screen := terminal.waitForSelection(t, 31)
+			want := fmt.Sprintf("  30 │ %s", test.answer)
+			if !strings.Contains(screen, want) {
+				t.Fatalf("Preset Answer %q was not rendered exactly; want line containing %q:\n%s", test.key, want, screen)
+			}
+			terminal.send(t, "q")
+			terminal.waitForExit(t)
+		})
+	}
+}
+
+func TestXCommitsExplainFurtherAndAutoAdvances(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "30")
+	terminal.send(t, "x")
+	screen := terminal.waitForSelection(t, 31)
+	if !strings.Contains(screen, "  30 │ explain further") {
+		t.Fatalf("x did not commit the exact elaboration request:\n%s", screen)
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestFinalPresetCommitGrowsAndScrollsWorksheetAndResumeRestoresPosition(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "1")
+
+	for selected := 2; selected <= 11; selected++ {
+		terminal.send(t, "r")
+		terminal.waitForSelection(t, selected)
+	}
+
+	terminal.waitFor(t, "11 Answer Slots")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	resumedAtEnd := startTerminal(t, workingDir)
+	resumedAtEnd.waitForSelection(t, 11)
+	screen := resumedAtEnd.waitFor(t, "Selected Answer 11 (full):")
+	assertVisibleAnswerSlotRange(t, screen, 2, 11)
+	for number := 2; number <= 10; number++ {
+		if !strings.Contains(screen, fmt.Sprintf("  %d │ recommended", number)) {
+			t.Fatalf("resumed Worksheet lost Preset Answer %d:\n%s", number, screen)
+		}
+	}
+	if !regexp.MustCompile(`(?m)^> 11 │ $`).MatchString(screen) {
+		t.Fatalf("grown Answer Slot is not selected and empty after resume:\n%s", screen)
+	}
+
+	for selected := 10; selected >= 1; selected-- {
+		resumedAtEnd.send(t, "k")
+		resumedAtEnd.waitForSelection(t, selected)
+	}
+	resumedAtEnd.send(t, "q")
+	resumedAtEnd.waitForExit(t)
+
+	resumedAtStart := startTerminal(t, workingDir)
+	resumedAtStart.waitForSelection(t, 1)
+	screen = resumedAtStart.waitFor(t, "Selected Answer 1 (full):")
+	assertVisibleAnswerSlotRange(t, screen, 1, 10)
+	for number := 1; number <= 10; number++ {
+		if !strings.Contains(screen, fmt.Sprintf("%d │ recommended", number)) {
+			t.Fatalf("resumed Worksheet lost Preset Answer %d:\n%s", number, screen)
+		}
+	}
+	for selected := 2; selected <= 11; selected++ {
+		resumedAtStart.send(t, "j")
+		resumedAtStart.waitForSelection(t, selected)
+	}
+	resumedAtStart.send(t, "q")
+	resumedAtStart.waitForExit(t)
+
+	resumedAfterNavigation := startTerminal(t, workingDir)
+	resumedAfterNavigation.waitForSelection(t, 11)
+	screen = resumedAfterNavigation.waitFor(t, "Selected Answer 11 (full):")
+	if !strings.Contains(screen, "11 Answer Slots") {
+		t.Fatalf("navigation grew the Worksheet instead of preserving 11 slots:\n%s", screen)
+	}
+	assertVisibleAnswerSlotRange(t, screen, 2, 11)
+	resumedAfterNavigation.send(t, "q")
+	resumedAfterNavigation.waitForExit(t)
+}
+
+func assertVisibleAnswerSlotRange(t *testing.T, screen string, first, last int) {
+	t.Helper()
+	slots := answerSlotLinePattern.FindAllStringSubmatch(screen, -1)
+	if len(slots) != last-first+1 || slots[0][1] != fmt.Sprintf("%d", first) || slots[len(slots)-1][1] != fmt.Sprintf("%d", last) {
+		t.Fatalf("visible Answer Slots do not span %d through %d:\n%s", first, last, screen)
+	}
+}
+
+func TestLongAnswerIsTruncatedInGridAndShownInFullPreview(t *testing.T) {
+	workingDir := t.TempDir()
+	longAnswer := "wide " + strings.Repeat("界", 30)
+	installWorksheetFixture(t, workingDir, filepath.Join("testdata", "long-answer-worksheet.json"))
+
+	terminal := startTerminal(t, workingDir)
+	screen := terminal.waitFor(t, longAnswer)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	gridAnswerPattern := regexp.MustCompile(`(?m)^> 20 │ (.*)$`)
+	match := gridAnswerPattern.FindStringSubmatch(screen)
+	if len(match) != 2 {
+		t.Fatalf("selected Answer Slot is missing from grid:\n%s", screen)
+	}
+	if match[1] == longAnswer || !strings.HasSuffix(match[1], "…") {
+		t.Fatalf("grid answer = %q, want a truncated value ending in an ellipsis", match[1])
+	}
+	if width := runewidth.StringWidth(match[1]); width > 40 {
+		t.Fatalf("grid answer display width = %d, want at most 40: %q", width, match[1])
+	}
+	preview := "Selected Answer 20 (full):\n" + longAnswer
+	if !strings.Contains(screen, preview) {
+		t.Fatalf("full selected answer preview is missing; want %q:\n%s", preview, screen)
+	}
+}
+
+func installWorksheetFixture(t *testing.T, workingDir, fixturePath string) {
+	t.Helper()
+	fixture, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("read Worksheet fixture: %v", err)
+	}
+	directory := filepath.Join(workingDir, ".grill-tui")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatalf("create persisted Worksheet directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "worksheet.json"), fixture, 0o600); err != nil {
+		t.Fatalf("write persisted Worksheet: %v", err)
+	}
+}
+
 type testTerminal struct {
 	cmd    *exec.Cmd
 	pty    *os.File
@@ -279,6 +529,27 @@ func (terminal *testTerminal) waitFor(t *testing.T, text string) string {
 	return ""
 }
 
+func (terminal *testTerminal) waitForSelection(t *testing.T, number int) string {
+	t.Helper()
+	want := fmt.Sprintf("%d", number)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		output := cleanTerminalOutput(terminal.output.String())
+		selections := selectedAnswerSlotPattern.FindAllStringSubmatch(output, -1)
+		if len(selections) > 0 && selections[len(selections)-1][1] == want {
+			return output
+		}
+		select {
+		case err := <-terminal.done:
+			t.Fatalf("grill-tui exited before selecting Answer Slot %s: %v; output:\n%s", want, err, output)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for selected Answer Slot %s; output:\n%s", want, cleanTerminalOutput(terminal.output.String()))
+	return ""
+}
+
 func (terminal *testTerminal) waitForExit(t *testing.T) {
 	t.Helper()
 	select {
@@ -293,6 +564,7 @@ func (terminal *testTerminal) waitForExit(t *testing.T) {
 
 var ansiSequence = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[()][0-2A-Z])`)
 var answerSlotLinePattern = regexp.MustCompile(`(?m)^[ >] ([0-9]+) │`)
+var selectedAnswerSlotPattern = regexp.MustCompile(`(?m)^> ([0-9]+) │`)
 
 func cleanTerminalOutput(output string) string {
 	return ansiSequence.ReplaceAllString(strings.ReplaceAll(output, "\r", ""), "")
