@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -30,7 +32,7 @@ var completeHelpBindingDescriptions = []string{
 	"Explain: x", "Custom: i inline; o external editor",
 	"Inline edit: Enter commit; Esc cancel",
 	"Correct: Esc clear; u undo", "Mouse: left click select; wheel scroll",
-	"Copy: s/Ctrl-S",
+	"Copy: s/Ctrl-S", "Reset: Ctrl-R twice within two seconds",
 	"Help: ?; Quit: q, Ctrl-Q, Ctrl-C",
 }
 
@@ -86,6 +88,701 @@ func TestPositiveArgumentCreatesAndRendersWorksheet(t *testing.T) {
 	if !stateInfo.Mode().IsRegular() {
 		t.Fatalf("Worksheet state is not a regular file: %s", stateInfo.Mode())
 	}
+}
+
+func TestWorksheetStateUsesSchemaOneAndOwnerOnlyArtifacts(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "41")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	directoryInfo, err := os.Stat(stateDirectory)
+	if err != nil {
+		t.Fatalf("stat state directory: %v", err)
+	}
+	if permissions := directoryInfo.Mode().Perm(); permissions != 0o700 {
+		t.Fatalf("state directory permissions = %o, want 700", permissions)
+	}
+
+	statePath := filepath.Join(stateDirectory, "worksheet.json")
+	state, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read Worksheet state: %v", err)
+	}
+	var document struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	if err := json.Unmarshal(state, &document); err != nil {
+		t.Fatalf("decode Worksheet state: %v", err)
+	}
+	if document.SchemaVersion != 1 {
+		t.Fatalf("schema version = %d, want 1; state: %s", document.SchemaVersion, state)
+	}
+	assertFilePermissions(t, statePath, 0o600)
+
+	ignorePath := filepath.Join(stateDirectory, ".gitignore")
+	ignore, err := os.ReadFile(ignorePath)
+	if err != nil {
+		t.Fatalf("read state-directory .gitignore: %v", err)
+	}
+	if string(ignore) != "*\n" {
+		t.Fatalf("state-directory .gitignore = %q, want %q", ignore, "*\\n")
+	}
+	assertFilePermissions(t, ignorePath, 0o600)
+}
+
+func assertFilePermissions(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if permissions := info.Mode().Perm(); permissions != want {
+		t.Fatalf("%s permissions = %o, want %o", path, permissions, want)
+	}
+}
+
+func TestCommittedMutationsAtomicallyReplacePrimaryAndMaintainBackup(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "41")
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	primaryPath := filepath.Join(stateDirectory, "worksheet.json")
+	backupPath := filepath.Join(stateDirectory, "worksheet.backup.json")
+
+	initial := readValidWorksheetDocument(t, primaryPath)
+	initialBytes, err := os.ReadFile(primaryPath)
+	if err != nil {
+		t.Fatalf("read initial primary: %v", err)
+	}
+	initialBackupBytes, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read initial last-known-good backup: %v", err)
+	}
+	if !bytes.Equal(initialBackupBytes, initialBytes) {
+		t.Fatalf("initial backup does not match primary\nprimary: %s\nbackup: %s", initialBytes, initialBackupBytes)
+	}
+
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 42)
+	afterFirstMutationBytes, err := os.ReadFile(primaryPath)
+	if err != nil {
+		t.Fatalf("read primary after first mutation: %v", err)
+	}
+	afterFirstMutation := decodeValidWorksheetDocument(t, primaryPath, afterFirstMutationBytes)
+	if got := afterFirstMutation.Slots[0].Answer; got != "recommended" {
+		t.Fatalf("first committed answer = %q, want recommended", got)
+	}
+	backupAfterFirst := readValidWorksheetDocument(t, backupPath)
+	if backupAfterFirst.Selected != initial.Selected || backupAfterFirst.Slots[0].Answer != initial.Slots[0].Answer {
+		t.Fatalf("backup does not contain the state preceding the first mutation: %#v", backupAfterFirst)
+	}
+
+	terminal.send(t, "y")
+	terminal.waitForSelection(t, 43)
+	primaryAfterSecond := readValidWorksheetDocument(t, primaryPath)
+	if got := primaryAfterSecond.Slots[1].Answer; got != "yes" {
+		t.Fatalf("second committed answer = %q, want yes", got)
+	}
+	backupAfterSecondBytes, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read backup after second mutation: %v", err)
+	}
+	if !bytes.Equal(backupAfterSecondBytes, afterFirstMutationBytes) {
+		t.Fatalf("backup is not the exact previous primary\nwant: %s\ngot: %s", afterFirstMutationBytes, backupAfterSecondBytes)
+	}
+	assertFilePermissions(t, primaryPath, 0o600)
+	assertFilePermissions(t, backupPath, 0o600)
+
+	entries, err := os.ReadDir(stateDirectory)
+	if err != nil {
+		t.Fatalf("read state directory: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("atomic replacement leaked temporary artifact %q", entry.Name())
+		}
+	}
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestCorruptPrimaryRecoversFromBackupAndPreservesEvidence(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "41")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 42)
+	terminal.send(t, "y")
+	terminal.waitForSelection(t, 43)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	primaryPath := filepath.Join(stateDirectory, "worksheet.json")
+	backupPath := filepath.Join(stateDirectory, "worksheet.backup.json")
+	backupBeforeRecovery, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read recovery backup: %v", err)
+	}
+	corruptPrimary := []byte("{interrupted write")
+	if err := os.WriteFile(primaryPath, corruptPrimary, 0o600); err != nil {
+		t.Fatalf("install corrupt primary: %v", err)
+	}
+
+	recovered := startTerminal(t, workingDir)
+	screen := recovered.waitFor(t, "Recovered Worksheet from backup")
+	recovered.waitForSelection(t, 42)
+	if !strings.Contains(screen, "  41 │ recommended") {
+		t.Fatalf("recovered Worksheet did not load the last-known-good backup:\n%s", screen)
+	}
+	if answer := latestRenderedAnswer(t, screen, 42); answer != "" {
+		t.Fatalf("recovered backup unexpectedly includes later answer %q:\n%s", answer, screen)
+	}
+	recovered.send(t, "q")
+	recovered.waitForExit(t)
+
+	primaryAfterRecovery, err := os.ReadFile(primaryPath)
+	if err != nil {
+		t.Fatalf("read recovered primary: %v", err)
+	}
+	if !bytes.Equal(primaryAfterRecovery, backupBeforeRecovery) {
+		t.Fatalf("recovered primary does not exactly match backup\nbackup: %s\nprimary: %s", backupBeforeRecovery, primaryAfterRecovery)
+	}
+	backupAfterRecovery, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read backup after recovery: %v", err)
+	}
+	if !bytes.Equal(backupAfterRecovery, backupBeforeRecovery) {
+		t.Fatalf("recovery mutated the valid backup\nbefore: %s\nafter: %s", backupBeforeRecovery, backupAfterRecovery)
+	}
+
+	artifacts, err := filepath.Glob(filepath.Join(stateDirectory, "worksheet.corrupt-*.json"))
+	if err != nil {
+		t.Fatalf("find preserved corrupt artifacts: %v", err)
+	}
+	if len(artifacts) != 1 {
+		t.Fatalf("preserved corrupt artifact count = %d, want 1: %v", len(artifacts), artifacts)
+	}
+	preserved, err := os.ReadFile(artifacts[0])
+	if err != nil {
+		t.Fatalf("read preserved corrupt artifact: %v", err)
+	}
+	if !bytes.Equal(preserved, corruptPrimary) {
+		t.Fatalf("preserved corrupt artifact = %q, want %q", preserved, corruptPrimary)
+	}
+	assertFilePermissions(t, artifacts[0], 0o600)
+}
+
+func TestInterruptedReplacementRecoversMissingPrimaryAndPreservesTemporaryEvidence(t *testing.T) {
+	workingDir := createWorksheetWithBackup(t)
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	primaryPath := filepath.Join(stateDirectory, "worksheet.json")
+	backupPath := filepath.Join(stateDirectory, "worksheet.backup.json")
+	backup, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read last-known-good backup: %v", err)
+	}
+	if err := os.Remove(primaryPath); err != nil {
+		t.Fatalf("simulate missing primary after interrupted replacement: %v", err)
+	}
+	temporaryPath := filepath.Join(stateDirectory, ".worksheet.json.tmp-interrupted")
+	temporaryEvidence := []byte("partial replacement bytes")
+	if err := os.WriteFile(temporaryPath, temporaryEvidence, 0o600); err != nil {
+		t.Fatalf("install interrupted-write artifact: %v", err)
+	}
+
+	recovered := startTerminal(t, workingDir)
+	screen := recovered.waitFor(t, "Recovered missing primary state from backup")
+	if !strings.Contains(screen, "> 41 │ ") {
+		t.Fatalf("missing primary was not restored from the last-known-good backup:\n%s", screen)
+	}
+	recovered.send(t, "q")
+	recovered.waitForExit(t)
+
+	assertFileContents(t, primaryPath, backup)
+	assertFileContents(t, backupPath, backup)
+	assertFileContents(t, temporaryPath, temporaryEvidence)
+	assertFilePermissions(t, primaryPath, 0o600)
+}
+
+func TestKillingCLIAtAtomicWriteBoundariesLeavesValidRecoverableState(t *testing.T) {
+	tests := []struct {
+		name            string
+		temporaryPrefix string
+		input           string
+	}{
+		{
+			name:            "backup replacement during selection persistence",
+			temporaryPrefix: ".worksheet.backup.json.tmp-",
+			input:           "j",
+		},
+		{
+			name:            "primary replacement during committed answer mutation",
+			temporaryPrefix: ".worksheet.json.tmp-",
+			input:           "y",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			created := startTerminal(t, workingDir, "70")
+			created.send(t, "q")
+			created.waitForExit(t)
+
+			stateDirectory := filepath.Join(workingDir, ".grill-tui")
+			primaryPath := filepath.Join(stateDirectory, "worksheet.json")
+			document := readValidWorksheetDocument(t, primaryPath)
+			document.Slots[len(document.Slots)-1].Answer = strings.Repeat("x", 8<<20)
+			largeState, err := json.MarshalIndent(document, "", "  ")
+			if err != nil {
+				t.Fatalf("encode large interrupted-write fixture: %v", err)
+			}
+			largeState = append(largeState, '\n')
+			if err := os.WriteFile(primaryPath, largeState, 0o600); err != nil {
+				t.Fatalf("install large interrupted-write fixture: %v", err)
+			}
+
+			terminal := startTerminal(t, workingDir)
+			temporaryFound := make(chan string, 1)
+			stopWatching := make(chan struct{})
+			go func() {
+				for {
+					select {
+					case <-stopWatching:
+						return
+					default:
+					}
+					entries, readErr := os.ReadDir(stateDirectory)
+					if readErr != nil {
+						continue
+					}
+					for _, entry := range entries {
+						if strings.HasPrefix(entry.Name(), test.temporaryPrefix) {
+							_ = terminal.cmd.Process.Signal(syscall.SIGSTOP)
+							temporaryFound <- filepath.Join(stateDirectory, entry.Name())
+							return
+						}
+					}
+				}
+			}()
+			terminal.send(t, test.input)
+			var interruptedPath string
+			select {
+			case interruptedPath = <-temporaryFound:
+				close(stopWatching)
+			case <-time.After(10 * time.Second):
+				close(stopWatching)
+				t.Fatalf("did not observe atomic-write artifact with prefix %q", test.temporaryPrefix)
+			}
+			if _, err := os.Stat(interruptedPath); err != nil {
+				t.Fatalf("writer was not suspended at the observed boundary %s: %v", interruptedPath, err)
+			}
+			if err := terminal.cmd.Process.Kill(); err != nil {
+				t.Fatalf("kill CLI at write boundary: %v", err)
+			}
+			select {
+			case err := <-terminal.done:
+				if err == nil {
+					t.Fatal("CLI killed at a write boundary unexpectedly exited successfully")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("CLI did not exit after being killed at a write boundary")
+			}
+
+			readValidWorksheetDocument(t, primaryPath)
+			readValidWorksheetDocument(t, filepath.Join(stateDirectory, "worksheet.backup.json"))
+			if _, err := os.Stat(interruptedPath); err != nil {
+				t.Fatalf("interrupted-write evidence was not preserved: %v", err)
+			}
+
+			restarted := startTerminal(t, workingDir)
+			restarted.waitFor(t, "Worksheet ready")
+			time.Sleep(50 * time.Millisecond)
+			restarted.send(t, "q")
+			restarted.waitForExit(t)
+		})
+	}
+}
+
+func TestInvalidPrimaryAndBackupRefuseRecoveryWithoutChangingEvidence(t *testing.T) {
+	workingDir := createWorksheetWithBackup(t)
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	primaryPath := filepath.Join(stateDirectory, "worksheet.json")
+	backupPath := filepath.Join(stateDirectory, "worksheet.backup.json")
+	primaryEvidence := []byte("corrupt primary evidence")
+	backupEvidence := []byte("corrupt backup evidence")
+	if err := os.WriteFile(primaryPath, primaryEvidence, 0o600); err != nil {
+		t.Fatalf("install corrupt primary: %v", err)
+	}
+	if err := os.WriteFile(backupPath, backupEvidence, 0o600); err != nil {
+		t.Fatalf("install corrupt backup: %v", err)
+	}
+	if err := os.Chmod(primaryPath, 0o777); err != nil {
+		t.Fatalf("make corrupt primary overly permissive: %v", err)
+	}
+	if err := os.Chmod(backupPath, 0o777); err != nil {
+		t.Fatalf("make corrupt backup overly permissive: %v", err)
+	}
+
+	output := runCLIExpectFailure(t, workingDir)
+	for _, want := range []string{"safe recovery is impossible", "repair or restore", "both", "preserved"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("recovery refusal does not contain %q:\n%s", want, output)
+		}
+	}
+	assertFileContents(t, primaryPath, primaryEvidence)
+	assertFileContents(t, backupPath, backupEvidence)
+	assertFilePermissions(t, primaryPath, 0o600)
+	assertFilePermissions(t, backupPath, 0o600)
+	artifacts, err := filepath.Glob(filepath.Join(stateDirectory, "worksheet.corrupt-*.json"))
+	if err != nil {
+		t.Fatalf("find corrupt artifacts: %v", err)
+	}
+	if len(artifacts) != 0 {
+		t.Fatalf("unsafe recovery created unexpected diagnostic copies: %v", artifacts)
+	}
+}
+
+func TestUnsupportedSchemaIsRefusedWithoutFallbackOrMutation(t *testing.T) {
+	workingDir := createWorksheetWithBackup(t)
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	primaryPath := filepath.Join(stateDirectory, "worksheet.json")
+	backupPath := filepath.Join(stateDirectory, "worksheet.backup.json")
+	primary, err := os.ReadFile(primaryPath)
+	if err != nil {
+		t.Fatalf("read primary: %v", err)
+	}
+	unsupported := bytes.Replace(primary, []byte(`"schema_version": 1`), []byte(`"schema_version": 99`), 1)
+	if bytes.Equal(unsupported, primary) {
+		t.Fatal("test setup did not replace the schema version")
+	}
+	if err := os.WriteFile(primaryPath, unsupported, 0o600); err != nil {
+		t.Fatalf("install unsupported primary: %v", err)
+	}
+	backup, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if err := os.Chmod(primaryPath, 0o777); err != nil {
+		t.Fatalf("make unsupported primary overly permissive: %v", err)
+	}
+	if err := os.Chmod(backupPath, 0o777); err != nil {
+		t.Fatalf("make backup overly permissive: %v", err)
+	}
+
+	output := runCLIExpectFailure(t, workingDir)
+	for _, want := range []string{"unsupported schema version 99", "supports version 1", "no migration was attempted"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("unsupported-schema refusal does not contain %q:\n%s", want, output)
+		}
+	}
+	assertFileContents(t, primaryPath, unsupported)
+	assertFileContents(t, backupPath, backup)
+	assertFilePermissions(t, primaryPath, 0o600)
+	assertFilePermissions(t, backupPath, 0o600)
+	artifacts, err := filepath.Glob(filepath.Join(stateDirectory, "worksheet.corrupt-*.json"))
+	if err != nil {
+		t.Fatalf("find corrupt artifacts: %v", err)
+	}
+	if len(artifacts) != 0 {
+		t.Fatalf("unsupported schema was incorrectly treated as corruption: %v", artifacts)
+	}
+}
+
+func TestUnsupportedBackupSchemaIsRefusedWithoutMutation(t *testing.T) {
+	workingDir := createWorksheetWithBackup(t)
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	primaryPath := filepath.Join(stateDirectory, "worksheet.json")
+	backupPath := filepath.Join(stateDirectory, "worksheet.backup.json")
+	primary, err := os.ReadFile(primaryPath)
+	if err != nil {
+		t.Fatalf("read primary: %v", err)
+	}
+	backup, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	unsupported := bytes.Replace(backup, []byte(`"schema_version": 1`), []byte(`"schema_version": 99`), 1)
+	if bytes.Equal(unsupported, backup) {
+		t.Fatal("test setup did not replace the backup schema version")
+	}
+	if err := os.WriteFile(backupPath, unsupported, 0o600); err != nil {
+		t.Fatalf("install unsupported backup: %v", err)
+	}
+
+	output := runCLIExpectFailure(t, workingDir)
+	for _, want := range []string{"backup", "unsupported schema version 99", "supports version 1", "no migration was attempted"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("unsupported-backup refusal does not contain %q:\n%s", want, output)
+		}
+	}
+	assertFileContents(t, primaryPath, primary)
+	assertFileContents(t, backupPath, unsupported)
+}
+
+func TestValidExistingStateArtifactsAreTightenedToOwnerOnly(t *testing.T) {
+	workingDir := createWorksheetWithBackup(t)
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	paths := []string{
+		stateDirectory,
+		filepath.Join(stateDirectory, ".gitignore"),
+		filepath.Join(stateDirectory, "worksheet.lock"),
+		filepath.Join(stateDirectory, "worksheet.json"),
+		filepath.Join(stateDirectory, "worksheet.backup.json"),
+	}
+	for _, path := range paths {
+		if err := os.Chmod(path, 0o777); err != nil {
+			t.Fatalf("make %s overly permissive: %v", path, err)
+		}
+	}
+
+	terminal := startTerminal(t, workingDir)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+	assertFilePermissions(t, stateDirectory, 0o700)
+	for _, path := range paths[1:] {
+		assertFilePermissions(t, path, 0o600)
+	}
+}
+
+func TestMissingPrimaryWithInvalidBackupReportsRepairAction(t *testing.T) {
+	workingDir := createWorksheetWithBackup(t)
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	primaryPath := filepath.Join(stateDirectory, "worksheet.json")
+	backupPath := filepath.Join(stateDirectory, "worksheet.backup.json")
+	if err := os.Remove(primaryPath); err != nil {
+		t.Fatalf("remove primary: %v", err)
+	}
+	invalidBackup := []byte("invalid backup evidence")
+	if err := os.WriteFile(backupPath, invalidBackup, 0o600); err != nil {
+		t.Fatalf("install invalid backup: %v", err)
+	}
+
+	output := runCLIExpectFailure(t, workingDir)
+	for _, want := range []string{"safe recovery is impossible", "repair or restore", "worksheet.backup.json", "preserved"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("missing-primary diagnostic does not contain %q:\n%s", want, output)
+		}
+	}
+	assertFileContents(t, backupPath, invalidBackup)
+}
+
+func TestWorksheetAllowsOnlyOneWriterProcess(t *testing.T) {
+	workingDir := t.TempDir()
+	owner := startTerminal(t, workingDir, "70")
+	primaryPath := filepath.Join(workingDir, ".grill-tui", "worksheet.json")
+	beforeCompetitor, err := os.ReadFile(primaryPath)
+	if err != nil {
+		t.Fatalf("read primary before competing process: %v", err)
+	}
+
+	output := runCLIExpectFailure(t, workingDir, "99")
+	for _, want := range []string{"already open", "another process"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("competing-process diagnostic does not contain %q:\n%s", want, output)
+		}
+	}
+	assertFileContents(t, primaryPath, beforeCompetitor)
+	assertFilePermissions(t, filepath.Join(workingDir, ".grill-tui", "worksheet.lock"), 0o600)
+
+	owner.send(t, "r")
+	screen := owner.waitForSelection(t, 71)
+	if !strings.Contains(screen, "  70 │ recommended") {
+		t.Fatalf("lock owner could not continue mutating its Worksheet:\n%s", screen)
+	}
+	owner.send(t, "q")
+	owner.waitForExit(t)
+
+	resumed := startTerminal(t, workingDir)
+	screen = resumed.waitForSelection(t, 71)
+	if !strings.Contains(screen, "  70 │ recommended") {
+		t.Fatalf("Worksheet was damaged by competing process:\n%s", screen)
+	}
+	resumed.send(t, "q")
+	resumed.waitForExit(t)
+}
+
+func TestResetRequiresConfirmationAndReturnsToStartingPrompt(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "70")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 71)
+	stateDirectory := filepath.Join(workingDir, ".grill-tui")
+	primaryPath := filepath.Join(stateDirectory, "worksheet.json")
+	backupPath := filepath.Join(stateDirectory, "worksheet.backup.json")
+	if _, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("reset test requires a backup: %v", err)
+	}
+
+	terminal.send(t, "\x12")
+	screen := terminal.waitFor(t, "Reset armed")
+	if !strings.Contains(screen, "press Ctrl-R again within 2 seconds") {
+		t.Fatalf("reset confirmation guidance is incomplete:\n%s", screen)
+	}
+	if _, err := os.Stat(primaryPath); err != nil {
+		t.Fatalf("first reset key changed primary state: %v", err)
+	}
+	if _, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("first reset key changed backup state: %v", err)
+	}
+
+	terminal.send(t, "\x12")
+	screen = terminal.waitFor(t, "Worksheet reset")
+	if !strings.Contains(screen, "Starting number:") {
+		t.Fatalf("confirmed reset did not return to starting-number prompt:\n%s", screen)
+	}
+	for _, path := range []string{primaryPath, backupPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("confirmed reset left %s behind; stat error = %v", path, err)
+		}
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	restarted := startTerminal(t, workingDir)
+	screen = restarted.waitFor(t, "Starting number:")
+	if strings.Contains(screen, "70 Answer") || strings.Contains(screen, "recommended") {
+		t.Fatalf("post-reset restart resumed discarded Worksheet data:\n%s", screen)
+	}
+	restarted.send(t, "90\r")
+	restarted.waitForSelection(t, 90)
+	restarted.send(t, "q")
+	restarted.waitForExit(t)
+}
+
+func TestAnyOtherKeyDisarmsResetAndStillPerformsItsAction(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "70")
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 71)
+
+	terminal.send(t, "\x12")
+	terminal.waitFor(t, "Reset armed")
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 72)
+
+	terminal.send(t, "\x12")
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(workingDir, ".grill-tui", "worksheet.json")); err != nil {
+		t.Fatalf("single Ctrl-R after cancellation reset the Worksheet: %v", err)
+	}
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 73)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestResetConfirmationExpiresAfterTwoSeconds(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "70")
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 71)
+
+	terminal.send(t, "\x12")
+	terminal.waitFor(t, "Reset armed")
+	terminal.waitFor(t, "Reset disarmed after 2 seconds")
+
+	terminal.send(t, "\x12")
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(workingDir, ".grill-tui", "worksheet.json")); err != nil {
+		t.Fatalf("Ctrl-R after expiration reset the Worksheet: %v", err)
+	}
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 72)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestResetCannotConfirmAfterDeadlineWhenProcessWasSuspended(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "70")
+	terminal.send(t, "\x12")
+	terminal.waitFor(t, "Reset armed")
+	if err := terminal.cmd.Process.Signal(os.Signal(syscall.SIGSTOP)); err != nil {
+		t.Fatalf("suspend grill-tui: %v", err)
+	}
+	time.Sleep(2100 * time.Millisecond)
+	terminal.send(t, "\x12")
+	if err := terminal.cmd.Process.Signal(os.Signal(syscall.SIGCONT)); err != nil {
+		t.Fatalf("resume grill-tui: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(workingDir, ".grill-tui", "worksheet.json")); err != nil {
+		t.Fatalf("Ctrl-R after the deadline reset the Worksheet: %v", err)
+	}
+	terminal.send(t, "j")
+	terminal.waitForSelection(t, 71)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func createWorksheetWithBackup(t *testing.T) string {
+	t.Helper()
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "41")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 42)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+	return workingDir
+}
+
+func runCLIExpectFailure(t *testing.T, workingDir string, args ...string) string {
+	t.Helper()
+	command := exec.Command(grillTUIBinary, args...)
+	command.Dir = workingDir
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("grill-tui unexpectedly succeeded; output:\n%s", output)
+	}
+	return cleanTerminalOutput(string(output))
+}
+
+func assertFileContents(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("%s changed\nwant: %q\ngot: %q", path, want, got)
+	}
+}
+
+type worksheetDocument struct {
+	SchemaVersion int `json:"schema_version"`
+	Slots         []struct {
+		Number int    `json:"number"`
+		Answer string `json:"answer"`
+	} `json:"slots"`
+	Selected int `json:"selected"`
+	Viewport int `json:"viewport"`
+}
+
+func readValidWorksheetDocument(t *testing.T, path string) worksheetDocument {
+	t.Helper()
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return decodeValidWorksheetDocument(t, path, encoded)
+}
+
+func decodeValidWorksheetDocument(t *testing.T, path string, encoded []byte) worksheetDocument {
+	t.Helper()
+	var document worksheetDocument
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		t.Fatalf("decode %s: %v; contents: %q", path, err, encoded)
+	}
+	if document.SchemaVersion != 1 {
+		t.Fatalf("%s schema version = %d, want 1", path, document.SchemaVersion)
+	}
+	if len(document.Slots) == 0 || document.Selected < 0 || document.Selected >= len(document.Slots) {
+		t.Fatalf("%s contains invalid Worksheet state: %#v", path, document)
+	}
+	return document
 }
 
 func TestPromptRejectsNonPositiveInputThenCreatesWorksheet(t *testing.T) {
@@ -1400,7 +2097,7 @@ func TestClipboardWriteFailureFallsBackToNextEnvironmentBackend(t *testing.T) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		t.Fatalf("create persisted Worksheet directory: %v", err)
 	}
-	fixture := fmt.Sprintf(`{"slots":[{"number":1,"answer":"%s"},{"number":2,"answer":""}],"selected":1,"viewport":0}`, largeAnswer)
+	fixture := fmt.Sprintf(`{"schema_version":1,"slots":[{"number":1,"answer":"%s"},{"number":2,"answer":""}],"selected":1,"viewport":0}`, largeAnswer)
 	if err := os.WriteFile(filepath.Join(directory, "worksheet.json"), []byte(fixture), 0o600); err != nil {
 		t.Fatalf("write persisted Worksheet: %v", err)
 	}

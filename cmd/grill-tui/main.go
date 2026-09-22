@@ -21,6 +21,11 @@ func run(args []string) error {
 	if len(args) > 1 {
 		return fmt.Errorf("provide at most one positive starting number")
 	}
+	worksheetLock, err := acquireWorksheetLock()
+	if err != nil {
+		return err
+	}
+	defer worksheetLock.release()
 
 	useColor := os.Getenv("NO_COLOR") == ""
 	initialModel := worksheetModel{
@@ -28,10 +33,11 @@ func run(args []string) error {
 		size:     defaultTerminalSize,
 		useColor: useColor,
 	}
-	existing, err := loadWorksheet()
+	existing, recoveryStatus, err := loadWorksheet()
 	if err == nil {
 		initialModel.mode = normalMode
 		initialModel.worksheet = existing
+		initialModel.status = recoveryStatus
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	} else if len(args) == 1 {

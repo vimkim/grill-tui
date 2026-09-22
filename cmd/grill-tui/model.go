@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
@@ -34,6 +35,8 @@ var (
 	minimumTerminalSize = terminalSize{width: 50, height: 15}
 )
 
+const resetConfirmationWindow = 2 * time.Second
+
 type interactionMode uint8
 
 const (
@@ -58,11 +61,18 @@ type worksheetModel struct {
 	size       terminalSize
 	helpOpen   bool
 	useColor   bool
+	resetArmed bool
+	resetToken uint64
+	resetBy    time.Time
 }
 
 type externalEditorFinishedMsg struct {
 	answer string
 	err    error
+}
+
+type resetExpiredMsg struct {
+	token uint64
 }
 
 func (worksheetModel) Init() tea.Cmd {
@@ -77,6 +87,14 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			model.status = fmt.Sprintf("Could not copy Answer List: %v", copied.err)
 		} else {
 			model.status = fmt.Sprintf("Answer List copied using %s", copied.backend)
+		}
+		return model, nil
+	}
+	if expired, ok := message.(resetExpiredMsg); ok {
+		if model.resetArmed && expired.token == model.resetToken {
+			model.resetArmed = false
+			model.resetBy = time.Time{}
+			model.status = "Reset disarmed after 2 seconds; Worksheet unchanged"
 		}
 		return model, nil
 	}
@@ -98,6 +116,11 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return model.handleMouse(tea.MouseEvent(mouse)), nil
 	}
 	if key, ok := message.(tea.KeyMsg); ok {
+		if model.resetArmed && key.String() != "ctrl+r" {
+			model.resetArmed = false
+			model.resetToken++
+			model.resetBy = time.Time{}
+		}
 		if model.terminalTooSmall() {
 			switch key.String() {
 			case "q", "ctrl+q", "ctrl+c":
@@ -125,6 +148,32 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if key.String() == "?" {
 			model.helpOpen = true
 			return model, nil
+		}
+		if key.String() == "ctrl+r" {
+			now := time.Now()
+			if model.resetArmed && now.Before(model.resetBy) {
+				model.resetArmed = false
+				model.resetToken++
+				model.resetBy = time.Time{}
+				if err := resetWorksheetState(); err != nil {
+					model.status = fmt.Sprintf("Could not reset Worksheet; state preserved where possible: %v", err)
+					return model, nil
+				}
+				model.worksheet = worksheet{}
+				model.mode = startingNumberMode
+				model.startInput = ""
+				model.editInput = ""
+				model.status = "Worksheet reset; enter a positive starting number"
+				return model, nil
+			}
+			model.resetArmed = true
+			model.resetToken++
+			model.resetBy = now.Add(resetConfirmationWindow)
+			token := model.resetToken
+			model.status = "Reset armed — press Ctrl-R again within 2 seconds to discard this Worksheet"
+			return model, tea.Tick(resetConfirmationWindow, func(time.Time) tea.Msg {
+				return resetExpiredMsg{token: token}
+			})
 		}
 		switch key.String() {
 		case "esc":
@@ -449,6 +498,7 @@ Inline edit: Enter commit; Esc cancel
 Correct: Esc clear; u undo
 Mouse: left click select; wheel scroll
 Copy: s/Ctrl-S
+Reset: Ctrl-R twice within two seconds
 Help: ?; Quit: q, Ctrl-Q, Ctrl-C
 
 Press ? to close; Worksheet remains unchanged.
@@ -532,4 +582,4 @@ func wrappedLineCount(text string, width int) int {
 	return strings.Count(runewidth.Wrap(text, width), "\n") + 1
 }
 
-const compactHelp = "Help: ↑/↓ j/k move • Space skip • r/y/n 1-5 a-e x answer • i/o custom • Esc clear • u undo • s/Ctrl-S copy • ? help • q quit"
+const compactHelp = "Help: ↑/↓ j/k move • Space skip • r/y/n 1-5 a-e x answer • i/o custom • Esc clear • u undo • s/Ctrl-S copy • Ctrl-R reset • ? help • q quit"
