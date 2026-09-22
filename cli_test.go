@@ -311,6 +311,230 @@ func TestXCommitsExplainFurtherAndAutoAdvances(t *testing.T) {
 	terminal.waitForExit(t)
 }
 
+func TestInlineCustomAnswerIsSeededAndEscapeCancelsWithoutChangingAnswer(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "30")
+	terminal.send(t, "r")
+	terminal.waitForSelection(t, 31)
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 30)
+
+	terminal.send(t, "i")
+	editing := terminal.waitFor(t, "Inline Custom Answer 30: recommended")
+	if !strings.Contains(editing, "Enter commit • Esc cancel") {
+		t.Fatalf("inline editing help is missing:\n%s", editing)
+	}
+	terminal.send(t, " replacement")
+	terminal.waitFor(t, "recommended replacement")
+	terminal.send(t, "\x1b")
+	screen := terminal.waitFor(t, "Inline Custom Answer cancelled")
+	if !strings.Contains(screen, "> 30 │ recommended") {
+		t.Fatalf("cancelling inline editing changed the Answer Slot:\n%s", screen)
+	}
+	if !strings.Contains(screen, "Selected Answer 30 (full):\nrecommended") {
+		t.Fatalf("cancelling inline editing changed the selected-answer preview:\n%s", screen)
+	}
+
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestInlineCustomAnswerCommitAutoAdvancesGrowsAndSurvivesResume(t *testing.T) {
+	workingDir := t.TempDir()
+	terminal := startTerminal(t, workingDir, "90")
+	for selected := 91; selected <= 99; selected++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, selected)
+	}
+
+	terminal.send(t, "i")
+	terminal.waitFor(t, "Inline Custom Answer 99:")
+	terminal.send(t, "short custom answer\r")
+	screen := terminal.waitForSelection(t, 100)
+	if !strings.Contains(screen, "11 Answer Slots") || !strings.Contains(screen, "  99 │ short custom answer") {
+		t.Fatalf("inline commit did not grow the Worksheet with the exact answer:\n%s", screen)
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	resumed := startTerminal(t, workingDir)
+	resumed.waitForSelection(t, 100)
+	resumed.send(t, "k")
+	screen = resumed.waitFor(t, "Selected Answer 99 (full):\nshort custom answer")
+	if !strings.Contains(screen, "> 99 │ short custom answer") {
+		t.Fatalf("resumed Worksheet lost the inline Custom Answer:\n%s", screen)
+	}
+	resumed.send(t, "q")
+	resumed.waitForExit(t)
+}
+
+func TestInlineCustomAnswerKeepsBracketedPasteOnOneLine(t *testing.T) {
+	terminal := startTerminal(t, t.TempDir(), "70")
+	terminal.send(t, "i")
+	terminal.waitFor(t, "Inline Custom Answer 70:")
+	terminal.send(t, "\x1b[200~first\nsecond\x1b[201~")
+	screen := terminal.waitFor(t, "Inline Custom Answer 70: firstsecond")
+	if strings.Contains(screen, "Inline Custom Answer 70: first\nsecond") {
+		t.Fatalf("inline editing accepted a multiline paste:\n%s", screen)
+	}
+	terminal.send(t, "\r")
+	screen = terminal.waitForSelection(t, 71)
+	if !strings.Contains(screen, "  70 │ firstsecond") {
+		t.Fatalf("inline editing did not commit the paste as one line:\n%s", screen)
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestVisualEditorWithSpacesReceivesSeedAndCommitsMultilineCustomAnswer(t *testing.T) {
+	workingDir := t.TempDir()
+	fixtureDir := t.TempDir()
+	seedCapture := filepath.Join(fixtureDir, "seed capture.txt")
+	visual := writeEditorFixture(t, filepath.Join(fixtureDir, "visual editor with spaces"), `#!/bin/sh
+cp "$1" "$SEED_CAPTURE"
+printf 'first line\nsecond 界 line' > "$1"
+`)
+	editor := writeEditorFixture(t, filepath.Join(fixtureDir, "fallback-editor"), `#!/bin/sh
+printf 'wrong editor' > "$1"
+`)
+
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{values: map[string]string{
+		"VISUAL":       visual,
+		"EDITOR":       editor,
+		"SEED_CAPTURE": seedCapture,
+	}}, "30")
+	terminal.send(t, "i")
+	terminal.waitFor(t, "Inline Custom Answer 30:")
+	terminal.send(t, "seeded answer\r")
+	terminal.waitForSelection(t, 31)
+	terminal.send(t, "k")
+	terminal.waitForSelection(t, 30)
+
+	terminal.send(t, "o")
+	screen := terminal.waitForSelection(t, 31)
+	if !strings.Contains(screen, "  30 │ first line second 界 line") {
+		t.Fatalf("external-editor answer was not compact in the grid:\n%s", screen)
+	}
+	seed, err := os.ReadFile(seedCapture)
+	if err != nil {
+		t.Fatalf("read editor seed capture: %v", err)
+	}
+	if string(seed) != "seeded answer" {
+		t.Fatalf("editor draft seed = %q, want %q", seed, "seeded answer")
+	}
+	terminal.send(t, "k")
+	screen = terminal.waitFor(t, "Selected Answer 30 (full):\nfirst line\nsecond 界 line")
+	if strings.Contains(screen, "wrong editor") {
+		t.Fatalf("$EDITOR ran even though $VISUAL was configured:\n%s", screen)
+	}
+	terminal.send(t, "i")
+	screen = terminal.waitFor(t, "Inline Custom Answer 30: first line second 界 line")
+	if strings.Contains(screen, "Inline Custom Answer 30: first line\nsecond 界 line") {
+		t.Fatalf("a multiline seed made inline editing span multiple lines:\n%s", screen)
+	}
+	terminal.send(t, "\x1b")
+	terminal.waitFor(t, "Inline Custom Answer cancelled")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+
+	resumed := startTerminal(t, workingDir)
+	screen = resumed.waitFor(t, "Selected Answer 30 (full):\nfirst line\nsecond 界 line")
+	if !strings.Contains(screen, "> 30 │ first line second 界 line") {
+		t.Fatalf("multiline Custom Answer did not survive resume:\n%s", screen)
+	}
+	resumed.send(t, "q")
+	resumed.waitForExit(t)
+}
+
+func TestEditorFallbackCommitsAtFinalSlotAndGrowsWorksheet(t *testing.T) {
+	workingDir := t.TempDir()
+	editor := writeEditorFixture(t, filepath.Join(t.TempDir(), "editor"), `#!/bin/sh
+printf 'grown\nanswer' > "$1"
+`)
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{
+		values:  map[string]string{"EDITOR": editor},
+		removed: []string{"VISUAL"},
+	}, "40")
+	for selected := 41; selected <= 49; selected++ {
+		terminal.send(t, "j")
+		terminal.waitForSelection(t, selected)
+	}
+
+	terminal.send(t, "o")
+	screen := terminal.waitForSelection(t, 50)
+	if !strings.Contains(screen, "11 Answer Slots") || !strings.Contains(screen, "  49 │ grown answer") {
+		t.Fatalf("$EDITOR fallback did not commit and grow the Worksheet:\n%s", screen)
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestExternalEditorErrorsAreActionableAndLeaveAnswerUnchanged(t *testing.T) {
+	fixtureDir := t.TempDir()
+	nonzero := writeEditorFixture(t, filepath.Join(fixtureDir, "nonzero-editor"), "#!/bin/sh\nexit 23\n")
+	removesDraft := writeEditorFixture(t, filepath.Join(fixtureDir, "remove-draft-editor"), "#!/bin/sh\nrm -- \"$1\"\n")
+	tests := []struct {
+		name   string
+		env    environmentOverrides
+		status string
+	}{
+		{
+			name:   "missing configuration",
+			env:    environmentOverrides{removed: []string{"VISUAL", "EDITOR"}},
+			status: "set $VISUAL or $EDITOR to an executable path",
+		},
+		{
+			name: "launch failure",
+			env: environmentOverrides{
+				values:  map[string]string{"VISUAL": filepath.Join(fixtureDir, "missing-editor")},
+				removed: []string{"EDITOR"},
+			},
+			status: "External editor failed; Answer Slot unchanged",
+		},
+		{
+			name: "non-zero exit",
+			env: environmentOverrides{
+				values:  map[string]string{"VISUAL": nonzero},
+				removed: []string{"EDITOR"},
+			},
+			status: "exit status 23",
+		},
+		{
+			name: "read failure",
+			env: environmentOverrides{
+				values:  map[string]string{"VISUAL": removesDraft},
+				removed: []string{"EDITOR"},
+			},
+			status: "read saved draft",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			terminal := startTerminalWithEnvironment(t, t.TempDir(), test.env, "60")
+			terminal.send(t, "r")
+			terminal.waitForSelection(t, 61)
+			terminal.send(t, "k")
+			terminal.waitForSelection(t, 60)
+
+			terminal.send(t, "o")
+			screen := terminal.waitFor(t, test.status)
+			if !strings.Contains(screen, "> 60 │ recommended") || !strings.Contains(screen, "Selected Answer 60 (full):\nrecommended") {
+				t.Fatalf("editor error changed the selected Answer Slot:\n%s", screen)
+			}
+			terminal.send(t, "q")
+			terminal.waitForExit(t)
+		})
+	}
+}
+
+func writeEditorFixture(t *testing.T, path, source string) string {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(source), 0o700); err != nil {
+		t.Fatalf("write editor fixture: %v", err)
+	}
+	return path
+}
+
 func TestFinalPresetCommitGrowsAndScrollsWorksheetAndResumeRestoresPosition(t *testing.T) {
 	workingDir := t.TempDir()
 	terminal := startTerminal(t, workingDir, "1")
@@ -446,10 +670,37 @@ func (buffer *synchronizedBuffer) String() string {
 }
 
 func startTerminal(t *testing.T, workingDir string, args ...string) *testTerminal {
+	return startTerminalWithEnvironment(t, workingDir, environmentOverrides{}, args...)
+}
+
+type environmentOverrides struct {
+	values  map[string]string
+	removed []string
+}
+
+func startTerminalWithEnvironment(t *testing.T, workingDir string, overrides environmentOverrides, args ...string) *testTerminal {
 	t.Helper()
 	cmd := exec.Command(grillTUIBinary, args...)
 	cmd.Dir = workingDir
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "NO_COLOR=1")
+	environment := make(map[string]string)
+	for _, entry := range os.Environ() {
+		name, value, found := strings.Cut(entry, "=")
+		if found {
+			environment[name] = value
+		}
+	}
+	for _, name := range overrides.removed {
+		delete(environment, name)
+	}
+	for name, value := range overrides.values {
+		environment[name] = value
+	}
+	environment["TERM"] = "xterm-256color"
+	environment["NO_COLOR"] = "1"
+	cmd.Env = make([]string, 0, len(environment))
+	for name, value := range environment {
+		cmd.Env = append(cmd.Env, name+"="+value)
+	}
 
 	ptyFile, err := pty.Start(cmd)
 	if err != nil {

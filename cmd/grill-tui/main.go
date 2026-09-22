@@ -22,7 +22,7 @@ func run(args []string) error {
 		return fmt.Errorf("provide at most one positive starting number")
 	}
 
-	initialModel := worksheetModel{prompting: true}
+	initialModel := worksheetModel{mode: startingNumberMode}
 	existing, err := loadWorksheet()
 	if err == nil {
 		initialModel = worksheetModel{worksheet: existing}

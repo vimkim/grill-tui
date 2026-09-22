@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,11 +13,25 @@ import (
 
 const gridAnswerWidth = 40
 
+type interactionMode uint8
+
+const (
+	normalMode interactionMode = iota
+	startingNumberMode
+	inlineAnswerMode
+)
+
 type worksheetModel struct {
 	worksheet  worksheet
-	prompting  bool
+	mode       interactionMode
 	startInput string
+	editInput  string
 	status     string
+}
+
+type externalEditorFinishedMsg struct {
+	answer string
+	err    error
 }
 
 func (worksheetModel) Init() tea.Cmd {
@@ -23,12 +39,45 @@ func (worksheetModel) Init() tea.Cmd {
 }
 
 func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	if finished, ok := message.(externalEditorFinishedMsg); ok {
+		if finished.err != nil {
+			model.status = fmt.Sprintf("External editor failed; Answer Slot unchanged: %v", finished.err)
+			return model, nil
+		}
+		return model.commitAnswer(finished.answer, "Custom Answer committed from external editor"), nil
+	}
 	if key, ok := message.(tea.KeyMsg); ok {
+		if model.mode == inlineAnswerMode {
+			switch key.String() {
+			case "enter":
+				model.mode = normalMode
+				return model.commitAnswer(model.editInput, "Custom Answer committed"), nil
+			case "esc":
+				model.mode = normalMode
+				model.editInput = ""
+				model.status = "Inline Custom Answer cancelled"
+				return model, nil
+			case "backspace":
+				runes := []rune(model.editInput)
+				if len(runes) > 0 {
+					model.editInput = string(runes[:len(runes)-1])
+				}
+				return model, nil
+			}
+			if len(key.Runes) > 0 {
+				for _, typed := range key.Runes {
+					if typed != '\n' && typed != '\r' {
+						model.editInput += string(typed)
+					}
+				}
+			}
+			return model, nil
+		}
 		switch key.String() {
 		case "q", "ctrl+q", "ctrl+c":
 			return model, tea.Quit
 		}
-		if model.prompting {
+		if model.mode == startingNumberMode {
 			switch key.String() {
 			case "enter":
 				start, err := parseStartingNumber(model.startInput)
@@ -47,7 +96,7 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 					return model, nil
 				}
 				model.worksheet = created
-				model.prompting = false
+				model.mode = normalMode
 				model.startInput = ""
 				model.status = "Worksheet created"
 				return model, nil
@@ -72,6 +121,13 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return model, nil
 		}
 		switch key.String() {
+		case "i":
+			model.mode = inlineAnswerMode
+			model.editInput = model.worksheet.Slots[model.worksheet.Selected].Answer
+			model.status = "Editing Custom Answer inline"
+			return model, nil
+		case "o":
+			return model.openExternalEditor()
 		case "j", "down", "ctrl+n", " ":
 			return model.moveSelection(1), nil
 		case "k", "up", "ctrl+p":
@@ -85,6 +141,50 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return model, nil
+}
+
+func (model worksheetModel) openExternalEditor() (worksheetModel, tea.Cmd) {
+	editor := os.Getenv("VISUAL")
+	if editor == "" {
+		editor = os.Getenv("EDITOR")
+	}
+	if editor == "" {
+		model.status = "Could not open external editor: set $VISUAL or $EDITOR to an executable path"
+		return model, nil
+	}
+
+	draft, err := os.CreateTemp("", "grill-tui-custom-answer-*")
+	if err != nil {
+		model.status = fmt.Sprintf("Could not create external-editor draft; Answer Slot unchanged: %v", err)
+		return model, nil
+	}
+	draftPath := draft.Name()
+	answer := model.worksheet.Slots[model.worksheet.Selected].Answer
+	if _, err := draft.WriteString(answer); err != nil {
+		_ = draft.Close()
+		_ = os.Remove(draftPath)
+		model.status = fmt.Sprintf("Could not seed external-editor draft; Answer Slot unchanged: %v", err)
+		return model, nil
+	}
+	if err := draft.Close(); err != nil {
+		_ = os.Remove(draftPath)
+		model.status = fmt.Sprintf("Could not prepare external-editor draft; Answer Slot unchanged: %v", err)
+		return model, nil
+	}
+
+	model.status = fmt.Sprintf("Editing Custom Answer in %s", editor)
+	command := exec.Command(editor, draftPath)
+	return model, tea.ExecProcess(command, func(editorErr error) tea.Msg {
+		defer os.Remove(draftPath)
+		if editorErr != nil {
+			return externalEditorFinishedMsg{err: fmt.Errorf("%w while running external editor %q", editorErr, editor)}
+		}
+		contents, readErr := os.ReadFile(draftPath)
+		if readErr != nil {
+			return externalEditorFinishedMsg{err: fmt.Errorf("read saved draft: %w", readErr)}
+		}
+		return externalEditorFinishedMsg{answer: string(contents)}
+	})
 }
 
 type presetAnswer string
@@ -132,7 +232,7 @@ func (model worksheetModel) persistWorksheet(candidate worksheet, successStatus 
 }
 
 func (model worksheetModel) View() string {
-	if model.prompting {
+	if model.mode == startingNumberMode {
 		return model.promptView()
 	}
 	return model.worksheetView()
@@ -171,16 +271,25 @@ func (model worksheetModel) worksheetView() string {
 		preview = "(empty)"
 	}
 	fmt.Fprintf(&view, "\nSelected Answer %d (full):\n%s\n", selected.Number, preview)
+	if model.mode == inlineAnswerMode {
+		fmt.Fprintf(&view, "\nInline Custom Answer %d: %s\n", selected.Number, singleLineAnswer(model.editInput))
+		view.WriteString("Help: Enter commit • Esc cancel\n")
+		return view.String()
+	}
 	status := model.status
 	if status == "" {
 		status = "Worksheet ready"
 	}
 	fmt.Fprintf(&view, "\nStatus: %s\n", status)
-	view.WriteString("Help: ↑/↓ j/k Ctrl-N/Ctrl-P move • Space skip • r/y/n 1-5 a-e x answer • q quit\n")
+	view.WriteString("Help: ↑/↓ j/k Ctrl-N/Ctrl-P move • Space skip • q quit\n")
+	view.WriteString("Answers: r/y/n 1-5 a-e x preset • i inline • o editor\n")
 	return view.String()
 }
 
 func truncateGridAnswer(answer string) string {
-	answer = strings.ReplaceAll(answer, "\n", " ")
-	return runewidth.Truncate(answer, gridAnswerWidth, "…")
+	return runewidth.Truncate(singleLineAnswer(answer), gridAnswerWidth, "…")
+}
+
+func singleLineAnswer(answer string) string {
+	return strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ").Replace(answer)
 }
