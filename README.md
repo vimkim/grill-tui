@@ -102,6 +102,34 @@ so only you can read it. Delete that directory to start over.
 
 Colors are used where the terminal supports them. Set `NO_COLOR` to turn them off.
 
+## Customizing keys
+
+Print the complete default Keymap as TOML with:
+
+```sh
+grill-tui config defaults
+```
+
+`grill-tui config install` creates that file in the platform's XDG configuration
+directory without overwriting an existing file. To intentionally replace it, use
+`grill-tui config install --force`; the command saves the previous file beside it as a
+timestamped backup first.
+
+Every action accepts an array of key names, so an action can have multiple bindings. The
+configuration is strict: unknown actions, invalid key names, conflicting bindings, and
+wrong value types are rejected before a Worksheet is opened. For
+example, this keeps `q` as the only quit binding and makes `z` and `v` move down:
+
+```toml
+[keymap]
+move_down = ["z", "v"]
+quit = ["q"]
+```
+
+Help always shows the effective bindings, including actions intentionally set to `[]`.
+`quit` may omit `ctrl+c`, but it cannot be empty. `copy` must retain at least one route
+other than `ctrl+s`, since some terminals intercept that control key.
+
 ## Development
 
 The project uses [just](https://github.com/casey/just):

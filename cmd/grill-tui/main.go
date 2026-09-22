@@ -18,8 +18,15 @@ func main() {
 }
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "config" {
+		return runConfigCommand(args[1:])
+	}
 	if len(args) > 1 {
 		return fmt.Errorf("provide at most one positive starting number")
+	}
+	effectiveKeymap, err := loadKeymap()
+	if err != nil {
+		return err
 	}
 	worksheetLock, err := acquireWorksheetLock()
 	if err != nil {
@@ -32,6 +39,7 @@ func run(args []string) error {
 		mode:     startingNumberMode,
 		size:     defaultTerminalSize,
 		useColor: useColor,
+		keymap:   effectiveKeymap,
 	}
 	existing, recoveryStatus, err := loadWorksheet()
 	if err == nil {

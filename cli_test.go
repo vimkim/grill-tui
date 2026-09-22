@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -733,6 +734,7 @@ func runCLIExpectFailure(t *testing.T, workingDir string, args ...string) string
 	t.Helper()
 	command := exec.Command(grillTUIBinary, args...)
 	command.Dir = workingDir
+	command.Env = overriddenEnvironment(t, environmentOverrides{})
 	output, err := command.CombinedOutput()
 	if err == nil {
 		t.Fatalf("grill-tui unexpectedly succeeded; output:\n%s", output)
@@ -879,6 +881,291 @@ func TestDefaultQuitBindingsExit(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			terminal := startTerminal(t, t.TempDir(), "5")
 			terminal.send(t, test.key)
+			terminal.waitForExit(t)
+		})
+	}
+}
+
+func TestConfiguredBindingsDriveActionsAndEffectiveHelp(t *testing.T) {
+	configHome := t.TempDir()
+	writeConfigFixture(t, configHome, "[keymap]\nmove_down = [\"z\", \"v\"]\n")
+	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{values: map[string]string{
+		"XDG_CONFIG_HOME": configHome,
+	}}, "5")
+
+	terminal.send(t, "j")
+	time.Sleep(50 * time.Millisecond)
+	beforeRemappedKey := cleanTerminalOutput(terminal.output.String())
+	selections := selectedAnswerSlotPattern.FindAllStringSubmatch(beforeRemappedKey, -1)
+	if selections[len(selections)-1][1] != "5" {
+		t.Fatalf("removed j binding moved the selection:\n%s", beforeRemappedKey)
+	}
+	terminal.send(t, "z")
+	terminal.waitForSelection(t, 6)
+	terminal.send(t, "v")
+	worksheet := terminal.waitForSelection(t, 7)
+	if !strings.Contains(worksheet, "z/v/↑/k/Ctrl-P move") {
+		t.Fatalf("compact help does not reflect the effective movement bindings:\n%s", worksheet)
+	}
+
+	mark := len(terminal.output.String())
+	terminal.send(t, "?")
+	help := terminal.waitForAfter(t, mark, "Complete Help")
+	if !strings.Contains(help, "Move down: z/v; up: ↑/k/Ctrl-P") {
+		t.Fatalf("complete help does not reflect the effective movement bindings:\n%s", help)
+	}
+	if strings.Contains(help, "↓/j/Ctrl-N") {
+		t.Fatalf("complete help still claims removed movement bindings are active:\n%s", help)
+	}
+	terminal.send(t, "?")
+	terminal.waitForSelection(t, 7)
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestConfigDefaultsPrintsTheCompleteAuthoritativeKeymap(t *testing.T) {
+	result := runCLI(t, t.TempDir(), environmentOverrides{values: map[string]string{
+		"XDG_CONFIG_HOME": t.TempDir(),
+	}}, "config", "defaults")
+	if result.err != nil {
+		t.Fatalf("config defaults failed: %v\nstderr: %s", result.err, result.stderr)
+	}
+	if result.stderr != "" {
+		t.Fatalf("config defaults wrote stderr: %q", result.stderr)
+	}
+	for _, line := range []string{
+		"[keymap]",
+		`move_down = ["down", "j", "ctrl+n"]`,
+		`move_up = ["up", "k", "ctrl+p"]`,
+		`skip = ["space"]`,
+		`recommended = ["r", "R"]`,
+		`yes = ["y", "Y"]`,
+		`no = ["n", "N"]`,
+		`choice_1 = ["1"]`, `choice_2 = ["2"]`, `choice_3 = ["3"]`, `choice_4 = ["4"]`, `choice_5 = ["5"]`,
+		`choice_a = ["a"]`, `choice_b = ["b"]`, `choice_c = ["c"]`, `choice_d = ["d"]`, `choice_e = ["e"]`,
+		`choice_upper_a = ["A"]`, `choice_upper_b = ["B"]`, `choice_upper_c = ["C"]`, `choice_upper_d = ["D"]`, `choice_upper_e = ["E"]`,
+		`explain = ["x"]`, `inline = ["i"]`, `external = ["o"]`, `clear = ["esc"]`, `undo = ["u"]`,
+		`copy = ["s", "ctrl+s"]`, `reset = ["ctrl+r"]`, `help = ["?"]`, `quit = ["q", "ctrl+q", "ctrl+c"]`,
+	} {
+		if !strings.Contains(result.stdout, line+"\n") && result.stdout != line+"\n" {
+			t.Fatalf("config defaults is missing %q:\n%s", line, result.stdout)
+		}
+	}
+}
+
+func TestConfigurationErrorsAreStrictAndActionable(t *testing.T) {
+	tests := []struct {
+		name       string
+		contents   string
+		wantDetail string
+	}{
+		{name: "unknown top-level option", contents: "mystery = true\n", wantDetail: "unknown option(s): mystery"},
+		{name: "unknown action", contents: "[keymap]\nmystery = [\"z\"]\n", wantDetail: "unknown option keymap.mystery"},
+		{name: "invalid key name", contents: "[keymap]\nmove_down = [\"ctrl+banana\"]\n", wantDetail: `keymap.move_down: invalid key name "ctrl+banana"`},
+		{name: "conflicting bindings", contents: "[keymap]\nmove_down = [\"k\"]\n", wantDetail: `binding "k" conflicts between move_down and move_up`},
+		{name: "terminal alias conflict", contents: "[keymap]\nmove_down = [\"ctrl+i\"]\nmove_up = [\"tab\"]\n", wantDetail: `binding "tab" conflicts between move_down and move_up`},
+		{name: "duplicate definition", contents: "[keymap]\nmove_down = [\"z\"]\nmove_down = [\"v\"]\n", wantDetail: "duplicate option keymap.move_down"},
+		{name: "invalid value type", contents: "[keymap]\nmove_down = \"z\"\n", wantDetail: "incompatible types"},
+		{name: "unreachable action", contents: "[keymap]\nquit = []\n", wantDetail: "keymap.quit must contain at least one key binding"},
+		{name: "Ctrl-S-only copy", contents: "[keymap]\ncopy = [\"ctrl+s\"]\n", wantDetail: "must include a binding other than ctrl+s"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			configHome := t.TempDir()
+			writeConfigFixture(t, configHome, test.contents)
+			result := runCLI(t, workingDir, environmentOverrides{values: map[string]string{
+				"XDG_CONFIG_HOME": configHome,
+			}}, "5")
+			if result.err == nil || !strings.Contains(result.stderr, test.wantDetail) {
+				t.Fatalf("invalid configuration error = %v, stderr = %q; want detail %q", result.err, result.stderr, test.wantDetail)
+			}
+			if _, err := os.Stat(filepath.Join(workingDir, ".grill-tui")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid configuration partially created Worksheet state: %v", err)
+			}
+		})
+	}
+}
+
+func TestOptionalActionCanBeUnbound(t *testing.T) {
+	configHome := t.TempDir()
+	writeConfigFixture(t, configHome, "[keymap]\nexternal = []\n")
+	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{values: map[string]string{
+		"XDG_CONFIG_HOME": configHome,
+	}}, "5")
+
+	terminal.send(t, "o")
+	time.Sleep(50 * time.Millisecond)
+	mark := len(terminal.output.String())
+	terminal.send(t, "?")
+	help := terminal.waitForAfter(t, mark, "Complete Help")
+	if !strings.Contains(help, "Custom: i inline; (unbound) external editor") {
+		t.Fatalf("complete help does not identify the unbound optional action:\n%s", help)
+	}
+	mark = len(terminal.output.String())
+	terminal.send(t, "?")
+	terminal.waitForAfter(t, mark, "Selected Answer 5 (full):")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestUnreadableConfigurationProducesAnActionableDiagnostic(t *testing.T) {
+	configHome := t.TempDir()
+	configPath := filepath.Join(configHome, "grill-tui", "config.toml")
+	if err := os.MkdirAll(configPath, 0o700); err != nil {
+		t.Fatalf("create unreadable configuration fixture: %v", err)
+	}
+	result := runCLI(t, t.TempDir(), environmentOverrides{values: map[string]string{
+		"XDG_CONFIG_HOME": configHome,
+	}}, "5")
+	if result.err == nil || !strings.Contains(result.stderr, "read configuration") || !strings.Contains(result.stderr, configPath) {
+		t.Fatalf("unreadable configuration error = %v, stderr = %q", result.err, result.stderr)
+	}
+}
+
+func TestConfigInstallIsSafeAndForcePreservesATimestampedBackup(t *testing.T) {
+	configHome := t.TempDir()
+	overrides := environmentOverrides{values: map[string]string{"XDG_CONFIG_HOME": configHome}}
+	defaults := runCLI(t, t.TempDir(), overrides, "config", "defaults")
+	if defaults.err != nil {
+		t.Fatalf("read authoritative defaults: %v", defaults.err)
+	}
+	installed := runCLI(t, t.TempDir(), overrides, "config", "install")
+	if installed.err != nil {
+		t.Fatalf("config install failed: %v\nstderr: %s", installed.err, installed.stderr)
+	}
+	configPath := filepath.Join(configHome, "grill-tui", "config.toml")
+	assertFileContentsAndMode(t, configPath, defaults.stdout, 0o600)
+
+	refused := runCLI(t, t.TempDir(), overrides, "config", "install")
+	if refused.err == nil || !strings.Contains(refused.stderr, "already exists") || !strings.Contains(refused.stderr, "--force") {
+		t.Fatalf("second config install error = %v, stderr = %q", refused.err, refused.stderr)
+	}
+	assertFileContentsAndMode(t, configPath, defaults.stdout, 0o600)
+
+	const previous = "[keymap]\nquit = [\"q\"]\n"
+	if err := os.WriteFile(configPath, []byte(previous), 0o600); err != nil {
+		t.Fatalf("replace configuration fixture: %v", err)
+	}
+	forced := runCLI(t, t.TempDir(), overrides, "config", "install", "--force")
+	if forced.err != nil {
+		t.Fatalf("config install --force failed: %v\nstderr: %s", forced.err, forced.stderr)
+	}
+	assertFileContentsAndMode(t, configPath, defaults.stdout, 0o600)
+	backups, err := filepath.Glob(configPath + ".backup-*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("timestamped configuration backups = %v, err = %v; want one", backups, err)
+	}
+	assertFileContentsAndMode(t, backups[0], previous, 0o600)
+}
+
+func TestConfiguredQuitCanRemoveCtrlCButCannotRemoveEveryBinding(t *testing.T) {
+	configHome := t.TempDir()
+	writeConfigFixture(t, configHome, "[keymap]\nquit = [\"q\"]\n")
+	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{values: map[string]string{
+		"XDG_CONFIG_HOME": configHome,
+	}}, "5")
+
+	terminal.send(t, "\x03")
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-terminal.done:
+		t.Fatalf("Ctrl-C exited after it was removed from quit bindings: %v", err)
+	default:
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestRemappedPresetBindingsKeepTheirActionSemantics(t *testing.T) {
+	configHome := t.TempDir()
+	writeConfigFixture(t, configHome, `[keymap]
+recommended = ["z"]
+choice_upper_a = ["v"]
+explain = ["g"]
+`)
+	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{values: map[string]string{
+		"XDG_CONFIG_HOME": configHome,
+	}}, "10")
+
+	for _, step := range []struct {
+		key    string
+		number int
+		answer string
+	}{
+		{key: "z", number: 10, answer: "recommended"},
+		{key: "v", number: 11, answer: "A"},
+		{key: "g", number: 12, answer: "explain further"},
+	} {
+		terminal.send(t, step.key)
+		screen := terminal.waitForSelection(t, step.number+1)
+		if answer := latestRenderedAnswer(t, screen, step.number); answer != step.answer {
+			t.Fatalf("remapped %q committed %q, want %q:\n%s", step.key, answer, step.answer, screen)
+		}
+	}
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestRemappedResetBindingControlsConfirmationAndHelp(t *testing.T) {
+	configHome := t.TempDir()
+	writeConfigFixture(t, configHome, "[keymap]\nreset = [\"z\"]\n")
+	workingDir := t.TempDir()
+	terminal := startTerminalWithEnvironment(t, workingDir, environmentOverrides{values: map[string]string{
+		"XDG_CONFIG_HOME": configHome,
+	}}, "70")
+
+	terminal.send(t, "\x12")
+	time.Sleep(50 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(workingDir, ".grill-tui", "worksheet.json")); err != nil {
+		t.Fatalf("removed Ctrl-R reset binding changed the Worksheet: %v", err)
+	}
+	terminal.send(t, "z")
+	armed := terminal.waitFor(t, "Reset armed")
+	if !strings.Contains(armed, "press z again within 2 seconds") || strings.Contains(armed, "press Ctrl-R again") {
+		t.Fatalf("reset status does not reflect the effective binding:\n%s", armed)
+	}
+	mark := len(terminal.output.String())
+	terminal.send(t, "?")
+	help := terminal.waitForAfter(t, mark, "Complete Help")
+	if !strings.Contains(help, "Reset: z twice within two seconds") || strings.Contains(help, "Reset: Ctrl-R") {
+		t.Fatalf("complete help does not reflect the effective reset binding:\n%s", help)
+	}
+	terminal.send(t, "?")
+	terminal.waitFor(t, "Reset disarmed; Worksheet unchanged")
+	terminal.send(t, "q")
+	terminal.waitForExit(t)
+}
+
+func TestInlineCustomAnswerAcceptsQuitBindingsAsText(t *testing.T) {
+	tests := []struct {
+		name       string
+		config     string
+		answer     string
+		normalQuit string
+	}{
+		{name: "default printable quit", answer: "question", normalQuit: "q"},
+		{name: "remapped printable quit", config: "[keymap]\nquit = [\"z\"]\n", answer: "pizza", normalQuit: "z"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configHome := t.TempDir()
+			if test.config != "" {
+				writeConfigFixture(t, configHome, test.config)
+			}
+			terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{values: map[string]string{
+				"XDG_CONFIG_HOME": configHome,
+			}}, "30")
+			terminal.send(t, "i")
+			terminal.waitFor(t, "Inline Custom Answer 30:")
+			terminal.send(t, test.answer+"\r")
+			screen := terminal.waitForSelection(t, 31)
+			if answer := latestRenderedAnswer(t, screen, 30); answer != test.answer {
+				t.Fatalf("inline answer = %q, want %q:\n%s", answer, test.answer, screen)
+			}
+			terminal.send(t, test.normalQuit)
 			terminal.waitForExit(t)
 		})
 	}
@@ -1812,6 +2099,19 @@ func writeEditorFixture(t *testing.T, path, source string) string {
 	return path
 }
 
+func writeConfigFixture(t *testing.T, configHome, contents string) string {
+	t.Helper()
+	configDirectory := filepath.Join(configHome, "grill-tui")
+	if err := os.MkdirAll(configDirectory, 0o700); err != nil {
+		t.Fatalf("create configuration fixture directory: %v", err)
+	}
+	configPath := filepath.Join(configDirectory, "config.toml")
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write configuration fixture: %v", err)
+	}
+	return configPath
+}
+
 func TestFinalPresetCommitGrowsAndScrollsWorksheetAndResumeRestoresPosition(t *testing.T) {
 	workingDir := t.TempDir()
 	terminal := startTerminal(t, workingDir, "1")
@@ -2363,33 +2663,48 @@ type environmentOverrides struct {
 	removed []string
 }
 
+type commandResult struct {
+	stdout string
+	stderr string
+	err    error
+}
+
+func runCLI(t *testing.T, workingDir string, overrides environmentOverrides, args ...string) commandResult {
+	t.Helper()
+	command := exec.Command(grillTUIBinary, args...)
+	command.Dir = workingDir
+	command.Env = overriddenEnvironment(t, overrides)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	return commandResult{stdout: stdout.String(), stderr: stderr.String(), err: err}
+}
+
+func assertFileContentsAndMode(t *testing.T, path, wantContents string, wantMode os.FileMode) {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if string(contents) != wantContents {
+		t.Fatalf("%s contents = %q, want %q", path, contents, wantContents)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if info.Mode().Perm() != wantMode {
+		t.Fatalf("%s mode = %04o, want %04o", path, info.Mode().Perm(), wantMode)
+	}
+}
+
 func startTerminalWithEnvironment(t *testing.T, workingDir string, overrides environmentOverrides, args ...string) *testTerminal {
 	t.Helper()
 	cmd := exec.Command(grillTUIBinary, args...)
 	cmd.Dir = workingDir
-	environment := make(map[string]string)
-	for _, entry := range os.Environ() {
-		name, value, found := strings.Cut(entry, "=")
-		if found {
-			environment[name] = value
-		}
-	}
-	for _, name := range overrides.removed {
-		delete(environment, name)
-	}
-	for name, value := range overrides.values {
-		environment[name] = value
-	}
-	if _, overridden := overrides.values["TERM"]; !overridden {
-		environment["TERM"] = "xterm-256color"
-	}
-	if _, overridden := overrides.values["NO_COLOR"]; !overridden {
-		environment["NO_COLOR"] = "1"
-	}
-	cmd.Env = make([]string, 0, len(environment))
-	for name, value := range environment {
-		cmd.Env = append(cmd.Env, name+"="+value)
-	}
+	cmd.Env = overriddenEnvironment(t, overrides)
 
 	ptyFile, err := pty.Start(cmd)
 	if err != nil {
@@ -2441,6 +2756,37 @@ func startTerminalWithEnvironment(t *testing.T, workingDir string, overrides env
 	}
 	t.Fatalf("grill-tui did not render its initial screen; output: %q", terminal.output.String())
 	return terminal
+}
+
+func overriddenEnvironment(t *testing.T, overrides environmentOverrides) []string {
+	t.Helper()
+	environment := make(map[string]string)
+	for _, entry := range os.Environ() {
+		name, value, found := strings.Cut(entry, "=")
+		if found {
+			environment[name] = value
+		}
+	}
+	for _, name := range overrides.removed {
+		delete(environment, name)
+	}
+	for name, value := range overrides.values {
+		environment[name] = value
+	}
+	if _, overridden := overrides.values["XDG_CONFIG_HOME"]; !overridden {
+		environment["XDG_CONFIG_HOME"] = t.TempDir()
+	}
+	if _, overridden := overrides.values["TERM"]; !overridden {
+		environment["TERM"] = "xterm-256color"
+	}
+	if _, overridden := overrides.values["NO_COLOR"]; !overridden {
+		environment["NO_COLOR"] = "1"
+	}
+	configured := make([]string, 0, len(environment))
+	for name, value := range environment {
+		configured = append(configured, name+"="+value)
+	}
+	return configured
 }
 
 func startTerminalWithEnv(t *testing.T, workingDir string, environment []string, args ...string) *testTerminal {

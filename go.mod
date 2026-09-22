@@ -3,6 +3,7 @@ module github.com/vimkim/grill-tui
 go 1.24.0
 
 require (
+	github.com/BurntSushi/toml v1.4.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/creack/pty v1.1.24
 	github.com/mattn/go-runewidth v0.0.16
