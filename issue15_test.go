@@ -93,7 +93,7 @@ func TestQueryRejectsInvalidAndReversedBoundsWithoutCreatingState(t *testing.T) 
 		args []string
 		want string
 	}{
-		{name: "missing bound", args: []string{"query", "1"}, want: "usage: grill-tui query FROM TO"},
+		{name: "missing bound", args: []string{"query", "1"}, want: "Usage:\n  grill-tui query FROM TO"},
 		{name: "non-numeric FROM", args: []string{"query", "one", "2"}, want: `FROM bound "one" must be a positive integer`},
 		{name: "zero TO", args: []string{"query", "1", "0"}, want: `TO bound "0" must be a positive integer`},
 		{name: "reversed", args: []string{"query", "9", "3"}, want: "FROM bound 9 must not exceed TO bound 3"},

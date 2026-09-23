@@ -99,6 +99,19 @@ func TestCLIVersionAliasesAreEquivalent(t *testing.T) {
 		t.Fatalf("version output is not in product format: %q", canonical)
 	}
 	assertNoWorksheetStorage(t, workingDir)
+
+	var canonicalHelp string
+	for _, args := range [][]string{{"version", "--help"}, {"-v", "--help"}, {"--version", "--help"}} {
+		result := runCLI(t, workingDir, environmentOverrides{}, args...)
+		if result.err != nil || result.stderr != "" {
+			t.Fatalf("grill-tui %v = err %v, stderr %q", args, result.err, result.stderr)
+		}
+		if canonicalHelp == "" {
+			canonicalHelp = result.stdout
+		} else if result.stdout != canonicalHelp {
+			t.Fatalf("grill-tui %v help = %q, want %q", args, result.stdout, canonicalHelp)
+		}
+	}
 }
 
 func TestCLIVersionUsesInjectedBuildMetadata(t *testing.T) {
@@ -191,6 +204,26 @@ func TestCLIFailuresShowConciseUsageAndSuggestions(t *testing.T) {
 			args: []string{"help", "query", "extra"},
 			want: []string{"at most one command", "Usage:", "grill-tui help [COMMAND]"},
 		},
+		{
+			name: "help does not mask invalid list combination",
+			args: []string{"list", "extra", "--help"},
+			want: []string{"does not accept arguments", "Usage:", "grill-tui list"},
+		},
+		{
+			name: "help does not mask invalid version combination",
+			args: []string{"version", "extra", "--help"},
+			want: []string{"does not accept arguments", "Usage:", "grill-tui version"},
+		},
+		{
+			name: "misspelled config install action",
+			args: []string{"config", "instal"},
+			want: []string{`unknown config command "instal"`, `Did you mean "install"?`, "Usage:", "grill-tui config install [--force]"},
+		},
+		{
+			name: "misspelled config defaults action",
+			args: []string{"config", "defualts"},
+			want: []string{`unknown config command "defualts"`, `Did you mean "defaults"?`, "Usage:", "grill-tui config defaults"},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -214,6 +247,18 @@ func TestCLIFailuresShowConciseUsageAndSuggestions(t *testing.T) {
 		})
 	}
 }
+
+func TestCLIUsageDoesNotRepeatTheInvocation(t *testing.T) {
+	result := runCLI(t, t.TempDir(), environmentOverrides{}, "query", "1")
+	if result.err == nil {
+		t.Fatal("query with a missing bound unexpectedly succeeded")
+	}
+	if count := strings.Count(result.stderr, queryInvocationForTest); count != 1 {
+		t.Fatalf("query usage contains its invocation %d times, want once:\n%s", count, result.stderr)
+	}
+}
+
+const queryInvocationForTest = "grill-tui query FROM TO [--name NAME]"
 
 func TestCLITypoSuggestionsAreValidForTheCommand(t *testing.T) {
 	workingDir := t.TempDir()

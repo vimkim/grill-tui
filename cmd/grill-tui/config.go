@@ -116,6 +116,9 @@ func runConfigCommand(args []string) error {
 	if len(args) == 2 && args[0] == "install" && args[1] == "--force" {
 		return installDefaultConfiguration(true)
 	}
+	if len(args) > 0 && args[0] != "defaults" && args[0] != "install" && !strings.HasPrefix(args[0], "-") {
+		return unknownCLIValue("config command", args[0], []string{"defaults", "install"}, configUsage)
+	}
 	optionCandidates := cliCommands["config"].options
 	if len(args) > 0 && args[0] == "install" {
 		optionCandidates = append(append([]string(nil), optionCandidates...), "--force")

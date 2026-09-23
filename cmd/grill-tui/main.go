@@ -173,7 +173,7 @@ func runQueryCommand(args []string) error {
 		return addCLIUsage(err, queryUsage)
 	}
 	if len(bounds) != 2 {
-		return cliFailure("usage: "+queryInvocation, "", queryUsage)
+		return cliFailure("query requires FROM and TO bounds", "", queryUsage)
 	}
 	from, err := parsePositiveNumber(bounds[0])
 	if err != nil {

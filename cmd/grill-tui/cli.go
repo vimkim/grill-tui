@@ -150,15 +150,17 @@ func runCLICommand(args []string) (bool, error) {
 		return true, err
 	}
 	if args[0] == "-v" || args[0] == "--version" {
+		if len(args) == 2 && (args[1] == "-h" || args[1] == "--help") {
+			_, err := fmt.Print(cliCommands["version"].help)
+			return true, err
+		}
 		return true, runVersionCommand(args[1:])
 	}
 	if command, found := cliCommands[args[0]]; found {
 		commandArgs := args[1:]
-		for _, argument := range commandArgs {
-			if argument == "-h" || argument == "--help" {
-				_, err := fmt.Print(command.help)
-				return true, err
-			}
+		if len(commandArgs) == 1 && (commandArgs[0] == "-h" || commandArgs[0] == "--help") {
+			_, err := fmt.Print(command.help)
+			return true, err
 		}
 		return true, command.run(commandArgs)
 	}
