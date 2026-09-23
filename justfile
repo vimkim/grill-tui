@@ -35,6 +35,10 @@ install:
 smoke-install:
     ./scripts/smoke-install.sh
 
+# Run the throwaway responsive UI prototype, e.g. `just prototype-responsive --name abc 11`
+prototype-responsive *args:
+    cd prototype-responsive && go run . {{ args }}
+
 # Remove build artifacts
 clean:
     rm -rf .tmp
