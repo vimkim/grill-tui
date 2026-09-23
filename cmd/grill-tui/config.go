@@ -116,7 +116,16 @@ func runConfigCommand(args []string) error {
 	if len(args) == 2 && args[0] == "install" && args[1] == "--force" {
 		return installDefaultConfiguration(true)
 	}
-	return fmt.Errorf("usage: grill-tui config defaults | grill-tui config install [--force]")
+	optionCandidates := cliCommands["config"].options
+	if len(args) > 0 && args[0] == "install" {
+		optionCandidates = append(append([]string(nil), optionCandidates...), "--force")
+	}
+	for _, argument := range args {
+		if strings.HasPrefix(argument, "-") && argument != "--force" {
+			return unknownCLIValue("option", argument, optionCandidates, configUsage)
+		}
+	}
+	return cliFailure("invalid config command", "", configUsage)
 }
 
 func installDefaultConfiguration(force bool) error {

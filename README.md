@@ -43,6 +43,16 @@ AI just asked. Pass it directly to skip the prompt:
 grill-tui 12
 ```
 
+Discover the complete command surface with `grill-tui help` (or `-h`/`--help`).
+Command-specific help is available as `grill-tui help launch`, `grill-tui help list`,
+`grill-tui help result`, `grill-tui help query`, and `grill-tui help config`; subcommands
+also accept `-h` and `--help` directly.
+
+Print build identity with `grill-tui version`, `grill-tui -v`, or
+`grill-tui --version`. Tagged binaries use the format `grill-tui vX.Y.Z`.
+Development binaries print `grill-tui devel` and add the abbreviated Git revision in
+parentheses when Go build information provides one.
+
 The worksheet belongs to the directory you started it from. Reopening it reports the last
 answered number and asks where to resume; Enter continues after that answer (or at the first
 slot when the worksheet is empty). Supplying a starting number selects that slot directly:

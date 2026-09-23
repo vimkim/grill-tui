@@ -27,25 +27,16 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) > 0 && args[0] == "config" {
-		return runConfigCommand(args[1:])
-	}
-	if len(args) > 0 && args[0] == "query" {
-		return runQueryCommand(args[1:])
-	}
-	if len(args) > 0 && args[0] == "result" {
-		return runResultCommand(args[1:])
-	}
-	if len(args) > 0 && args[0] == "list" {
-		return runListCommand(args[1:])
-	}
-	name, positional, err := parseWorksheetSelection(args)
-	if err != nil {
+	if handled, err := runCLICommand(args); handled {
 		return err
+	}
+	name, positional, err := parseWorksheetSelection(args, []string{"--help", "--name"}, launchUsage)
+	if err != nil {
+		return addCLIUsage(err, topLevelUsage)
 	}
 	selectWorksheetStorage(name)
 	if len(positional) > 1 {
-		return fmt.Errorf("provide at most one positive starting number")
+		return cliFailure("provide at most one positive starting number", "", launchUsage)
 	}
 	effectiveKeymap, err := loadKeymap()
 	if err != nil {
@@ -106,7 +97,10 @@ func run(args []string) error {
 
 func runListCommand(args []string) error {
 	if len(args) != 0 {
-		return errors.New("usage: grill-tui list")
+		if strings.HasPrefix(args[0], "-") {
+			return unknownCLIValue("option", args[0], cliCommands["list"].options, listUsage)
+		}
+		return cliFailure("list does not accept arguments", "", listUsage)
 	}
 	worksheets, err := discoverWorksheets()
 	if err != nil {
@@ -142,19 +136,19 @@ func runResultCommand(args []string) error {
 	for _, argument := range args {
 		if argument == "--answers" {
 			if answers {
-				return errors.New("provide --answers only once")
+				return cliFailure("provide --answers only once", "", resultUsage)
 			}
 			answers = true
 			continue
 		}
 		selectionArgs = append(selectionArgs, argument)
 	}
-	name, positional, err := parseWorksheetSelection(selectionArgs)
+	name, positional, err := parseWorksheetSelection(selectionArgs, cliCommands["result"].options, resultUsage)
 	if err != nil {
-		return err
+		return addCLIUsage(err, resultUsage)
 	}
 	if len(positional) != 0 {
-		return errors.New("usage: grill-tui result [--name NAME] [--answers]")
+		return cliFailure("result does not accept positional arguments", "", resultUsage)
 	}
 	selectWorksheetStorage(name)
 	storedWorksheet, err := activeWorksheetStore.loadReadOnly()
@@ -174,23 +168,23 @@ func runResultCommand(args []string) error {
 }
 
 func runQueryCommand(args []string) error {
-	name, bounds, err := parseWorksheetSelection(args)
+	name, bounds, err := parseWorksheetSelection(args, cliCommands["query"].options, queryUsage)
 	if err != nil {
-		return err
+		return addCLIUsage(err, queryUsage)
 	}
 	if len(bounds) != 2 {
-		return errors.New("usage: grill-tui query FROM TO [--name NAME]")
+		return cliFailure("usage: "+queryInvocation, "", queryUsage)
 	}
 	from, err := parsePositiveNumber(bounds[0])
 	if err != nil {
-		return fmt.Errorf("query FROM bound %q must be a positive integer", bounds[0])
+		return cliFailure(fmt.Sprintf("query FROM bound %q must be a positive integer", bounds[0]), "", queryUsage)
 	}
 	to, err := parsePositiveNumber(bounds[1])
 	if err != nil {
-		return fmt.Errorf("query TO bound %q must be a positive integer", bounds[1])
+		return cliFailure(fmt.Sprintf("query TO bound %q must be a positive integer", bounds[1]), "", queryUsage)
 	}
 	if from > to {
-		return fmt.Errorf("query FROM bound %d must not exceed TO bound %d", from, to)
+		return cliFailure(fmt.Sprintf("query FROM bound %d must not exceed TO bound %d", from, to), "", queryUsage)
 	}
 	selectWorksheetStorage(name)
 	storedWorksheet, err := activeWorksheetStore.loadReadOnly()
@@ -201,7 +195,7 @@ func runQueryCommand(args []string) error {
 	return err
 }
 
-func parseWorksheetSelection(args []string) (worksheetName, []string, error) {
+func parseWorksheetSelection(args, optionCandidates []string, usage string) (worksheetName, []string, error) {
 	name := string(defaultWorksheetName)
 	explicitName := false
 	positional := make([]string, 0, 1)
@@ -225,7 +219,7 @@ func parseWorksheetSelection(args []string) (worksheetName, []string, error) {
 			name = strings.TrimPrefix(argument, "--name=")
 			explicitName = true
 		case strings.HasPrefix(argument, "-"):
-			return "", nil, fmt.Errorf("unknown option %q", argument)
+			return "", nil, unknownCLIValue("option", argument, optionCandidates, usage)
 		default:
 			positional = append(positional, argument)
 		}
