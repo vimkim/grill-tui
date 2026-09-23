@@ -51,9 +51,15 @@ type worksheetUndo struct {
 }
 
 func (storedWorksheet worksheet) answerList() string {
+	return storedWorksheet.answerListBetween(storedWorksheet.FirstNumber, storedWorksheet.LastNumber)
+}
+
+func (storedWorksheet worksheet) answerListBetween(from, to int) string {
 	numbers := make([]int, 0, len(storedWorksheet.Answers))
 	for number := range storedWorksheet.Answers {
-		numbers = append(numbers, number)
+		if number >= from && number <= to {
+			numbers = append(numbers, number)
+		}
 	}
 	slices.Sort(numbers)
 	answers := make([]string, 0, len(numbers))

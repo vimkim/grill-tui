@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -26,6 +27,12 @@ func main() {
 func run(args []string) error {
 	if len(args) > 0 && args[0] == "config" {
 		return runConfigCommand(args[1:])
+	}
+	if len(args) > 0 && args[0] == "query" {
+		return runQueryCommand(args[1:])
+	}
+	if len(args) > 0 && args[0] == "result" {
+		return runResultCommand(args[1:])
 	}
 	name, positional, err := parseWorksheetSelection(args)
 	if err != nil {
@@ -89,6 +96,71 @@ func run(args []string) error {
 
 	program := tea.NewProgram(initialModel, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err = program.Run()
+	return err
+}
+
+func runResultCommand(args []string) error {
+	answers := false
+	selectionArgs := make([]string, 0, len(args))
+	for _, argument := range args {
+		if argument == "--answers" {
+			if answers {
+				return errors.New("provide --answers only once")
+			}
+			answers = true
+			continue
+		}
+		selectionArgs = append(selectionArgs, argument)
+	}
+	name, positional, err := parseWorksheetSelection(selectionArgs)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 0 {
+		return errors.New("usage: grill-tui result [--name NAME] [--answers]")
+	}
+	selectWorksheetStorage(name)
+	storedWorksheet, err := activeWorksheetStore.loadReadOnly()
+	if err != nil {
+		return err
+	}
+	if answers {
+		_, err = fmt.Print(storedWorksheet.answerList())
+		return err
+	}
+	absolutePath, err := filepath.Abs(activeWorksheetStore.databasePath)
+	if err != nil {
+		return fmt.Errorf("resolve Worksheet Database path: %w", err)
+	}
+	_, err = fmt.Fprintln(os.Stdout, absolutePath)
+	return err
+}
+
+func runQueryCommand(args []string) error {
+	name, bounds, err := parseWorksheetSelection(args)
+	if err != nil {
+		return err
+	}
+	if len(bounds) != 2 {
+		return errors.New("usage: grill-tui query FROM TO [--name NAME]")
+	}
+	from, err := parsePositiveNumber(bounds[0])
+	if err != nil {
+		return fmt.Errorf("query FROM bound %q must be a positive integer", bounds[0])
+	}
+	to, err := parsePositiveNumber(bounds[1])
+	if err != nil {
+		return fmt.Errorf("query TO bound %q must be a positive integer", bounds[1])
+	}
+	if from > to {
+		return fmt.Errorf("query FROM bound %d must not exceed TO bound %d", from, to)
+	}
+	selectWorksheetStorage(name)
+	storedWorksheet, err := activeWorksheetStore.loadReadOnly()
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Print(storedWorksheet.answerListBetween(from, to))
 	return err
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -209,6 +210,18 @@ func (store worksheetStore) load() (worksheet, error) {
 	if err != nil {
 		return worksheet{}, err
 	}
+	return store.loadFromDatabase(database)
+}
+
+func (store worksheetStore) loadReadOnly() (worksheet, error) {
+	database, err := store.openExistingReadOnlyDatabase()
+	if err != nil {
+		return worksheet{}, err
+	}
+	return store.loadFromDatabase(database)
+}
+
+func (store worksheetStore) loadFromDatabase(database *sql.DB) (worksheet, error) {
 	defer database.Close()
 	if err := requireSupportedSchema(database); err != nil {
 		return worksheet{}, fmt.Errorf("refuse to open Worksheet: %w; no migration was attempted", err)
@@ -217,7 +230,7 @@ func (store worksheetStore) load() (worksheet, error) {
 	var storedName string
 	var firstNumber, lastNumber, selected, viewport int
 	var encodedUndo sql.NullString
-	err = database.QueryRow(`
+	err := database.QueryRow(`
 SELECT worksheet_name, first_number, last_number, selected_index, viewport_index, undo_state
   FROM worksheet_state
  WHERE singleton = 1`).Scan(&storedName, &firstNumber, &lastNumber, &selected, &viewport, &encodedUndo)
@@ -270,6 +283,51 @@ SELECT worksheet_name, first_number, last_number, selected_index, viewport_index
 		return worksheet{}, fmt.Errorf("validate Worksheet Database: %w", err)
 	}
 	return storedWorksheet, nil
+}
+
+func (store worksheetStore) openExistingReadOnlyDatabase() (*sql.DB, error) {
+	if err := inspectReadOnlyDirectory(worksheetDataDirectory, "Worksheet data root"); err != nil {
+		return nil, err
+	}
+	if err := inspectReadOnlyDirectory(store.directory, "Worksheet directory"); err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(store.databasePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read Worksheet: %w", os.ErrNotExist)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect Worksheet Database: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refuse symbolic link for Worksheet Database %s", store.databasePath)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("Worksheet Database %s is not a regular file", store.databasePath)
+	}
+	absolutePath, err := filepath.Abs(store.databasePath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Worksheet Database path: %w", err)
+	}
+	databaseURL := (&url.URL{Scheme: "file", Path: absolutePath}).String() + "?mode=ro"
+	return openSQLiteDatabase(databaseURL, false)
+}
+
+func inspectReadOnlyDirectory(path, description string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read Worksheet: %w", os.ErrNotExist)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", description, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refuse symbolic link for %s %s", description, path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s %s is not a directory", description, path)
+	}
+	return nil
 }
 
 func (store worksheetStore) save(storedWorksheet worksheet) error {
