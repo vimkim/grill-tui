@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -8,21 +9,25 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 const (
 	worksheetDataDirectory = ".grill-data"
 	worksheetDatabaseFile  = "worksheet.sqlite"
+	worksheetBackupFile    = "worksheet.backup.sqlite"
 )
 
 type worksheetStore struct {
 	name         worksheetName
 	directory    string
 	databasePath string
+	backupPath   string
 }
 
 type worksheetInfo struct {
@@ -47,6 +52,7 @@ func newWorksheetStore(name worksheetName) worksheetStore {
 		name:         name,
 		directory:    directory,
 		databasePath: filepath.Join(directory, worksheetDatabaseFile),
+		backupPath:   filepath.Join(directory, worksheetBackupFile),
 	}
 }
 
@@ -113,8 +119,7 @@ SELECT worksheet_name, first_number, last_number, last_answered_number, answered
 }
 
 func loadWorksheet() (worksheet, string, error) {
-	storedWorksheet, err := activeWorksheetStore.load()
-	return storedWorksheet, "", err
+	return activeWorksheetStore.load()
 }
 
 func saveWorksheet(storedWorksheet worksheet) error {
@@ -282,12 +287,77 @@ SELECT worksheet_name,
 PRAGMA user_version = 1;
 `
 
-func (store worksheetStore) load() (worksheet, error) {
-	database, err := store.openExistingDatabase()
+func (store worksheetStore) load() (worksheet, string, error) {
+	primaryExists, err := protectExistingRegularFile(store.databasePath)
 	if err != nil {
-		return worksheet{}, err
+		return worksheet{}, "", fmt.Errorf("protect Worksheet Database: %w", err)
 	}
-	return store.loadFromDatabase(database)
+	backupExists, err := protectExistingRegularFile(store.backupPath)
+	if err != nil {
+		return worksheet{}, "", fmt.Errorf("protect Worksheet backup: %w", err)
+	}
+	if !primaryExists {
+		if !backupExists {
+			return worksheet{}, "", fmt.Errorf("read Worksheet: %w", os.ErrNotExist)
+		}
+		storedWorksheet, err := store.loadDatabasePath(store.backupPath)
+		if err != nil {
+			return worksheet{}, "", store.unrecoverableError("primary is missing", err)
+		}
+		if err := store.preserveOrphanedPrimarySidecars(); err != nil {
+			return worksheet{}, "", fmt.Errorf("preserve interrupted Worksheet artifacts before recovery: %w", err)
+		}
+		if err := store.restorePrimaryFromBackup(); err != nil {
+			return worksheet{}, "", err
+		}
+		return storedWorksheet, "Recovered missing Worksheet Database from validated backup", nil
+	}
+
+	storedWorksheet, err := store.loadDatabasePath(store.databasePath)
+	if err == nil {
+		if !backupExists {
+			if err := store.createValidatedCopy(store.databasePath, store.backupPath, store.directory); err != nil {
+				return worksheet{}, "", fmt.Errorf("rebuild missing Worksheet backup: %w", err)
+			}
+			return storedWorksheet, "Rebuilt missing Worksheet backup from validated primary", nil
+		}
+		backupWorksheet, backupErr := store.loadDatabasePath(store.backupPath)
+		if backupErr != nil {
+			var backupVersionError unsupportedSchemaVersionError
+			if errors.As(backupErr, &backupVersionError) {
+				return worksheet{}, "", fmt.Errorf("refuse to replace Worksheet backup: %w; no migration was attempted", backupErr)
+			}
+			if err := store.createValidatedCopy(store.databasePath, store.backupPath, store.directory); err != nil {
+				return worksheet{}, "", fmt.Errorf("rebuild invalid Worksheet backup: %w", err)
+			}
+			return storedWorksheet, "Rebuilt invalid Worksheet backup from validated primary", nil
+		}
+		if !reflect.DeepEqual(storedWorksheet, backupWorksheet) {
+			if err := store.createValidatedCopy(store.databasePath, store.backupPath, store.directory); err != nil {
+				return worksheet{}, "", fmt.Errorf("rebuild stale Worksheet backup: %w", err)
+			}
+			return storedWorksheet, "Rebuilt stale Worksheet backup from validated primary", nil
+		}
+		return storedWorksheet, "", nil
+	}
+	var versionError unsupportedSchemaVersionError
+	if errors.As(err, &versionError) {
+		return worksheet{}, "", fmt.Errorf("refuse to open Worksheet: %w; no migration was attempted", err)
+	}
+	if !backupExists {
+		return worksheet{}, "", store.unrecoverableError("primary is corrupt and no backup exists", err)
+	}
+	storedWorksheet, backupErr := store.loadDatabasePath(store.backupPath)
+	if backupErr != nil {
+		return worksheet{}, "", store.unrecoverableError("primary and backup are both unusable", errors.Join(err, backupErr))
+	}
+	if _, err := store.preserveCorruptPrimary(); err != nil {
+		return worksheet{}, "", fmt.Errorf("preserve corrupt Worksheet Database before recovery: %w", err)
+	}
+	if err := store.restorePrimaryFromBackup(); err != nil {
+		return worksheet{}, "", err
+	}
+	return storedWorksheet, "Recovered Worksheet from validated backup; corrupt primary preserved", nil
 }
 
 func (store worksheetStore) loadReadOnly() (worksheet, error) {
@@ -296,6 +366,10 @@ func (store worksheetStore) loadReadOnly() (worksheet, error) {
 		return worksheet{}, err
 	}
 	return store.loadFromDatabase(database)
+}
+
+func (store worksheetStore) unrecoverableError(reason string, cause error) error {
+	return fmt.Errorf("safe Worksheet recovery is impossible: %s: %w; primary and backup artifacts were preserved; repair or restore them manually in %s", reason, cause, store.directory)
 }
 
 func (store worksheetStore) loadFromDatabase(database *sql.DB) (worksheet, error) {
@@ -479,7 +553,236 @@ ON CONFLICT(singleton) DO UPDATE SET
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit Worksheet save: %w", err)
 	}
+	if err := store.replaceBackupFrom(database); err != nil {
+		return fmt.Errorf("maintain validated Worksheet backup: %w", err)
+	}
 	return store.protectDatabaseArtifacts()
+}
+
+type sqliteBackuper interface {
+	NewBackup(string) (*sqlite.Backup, error)
+}
+
+func (store worksheetStore) replaceBackupFrom(database *sql.DB) (finalErr error) {
+	return store.installValidatedSnapshot(database, store.backupPath, store.directory, ".worksheet.backup.sqlite.tmp-*")
+}
+
+func (store worksheetStore) installValidatedSnapshot(database *sql.DB, destinationPath, directory, pattern string) (finalErr error) {
+	temporaryPath, err := store.createValidatedSnapshot(database, directory, pattern)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if finalErr != nil {
+			_ = removeDatabaseArtifacts(temporaryPath)
+		}
+	}()
+	if err := removeDatabaseSidecars(destinationPath); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, destinationPath); err != nil {
+		return err
+	}
+	if err := syncDirectory(directory); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (store worksheetStore) createValidatedSnapshot(database *sql.DB, directory, pattern string) (path string, finalErr error) {
+	temporary, err := os.CreateTemp(directory, pattern)
+	if err != nil {
+		return "", err
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		if finalErr != nil {
+			_ = removeDatabaseArtifacts(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if err := temporary.Close(); err != nil {
+		return "", err
+	}
+	if err := createSQLiteBackup(database, temporaryPath); err != nil {
+		return "", err
+	}
+	if err := store.validateDatabasePath(temporaryPath); err != nil {
+		return "", fmt.Errorf("validate SQLite snapshot: %w", err)
+	}
+	if err := removeDatabaseSidecars(temporaryPath); err != nil {
+		return "", err
+	}
+	if err := syncRegularFile(temporaryPath); err != nil {
+		return "", err
+	}
+	return temporaryPath, nil
+}
+
+func (store worksheetStore) validateDatabasePath(path string) error {
+	_, err := store.loadDatabasePath(path)
+	return err
+}
+
+func (store worksheetStore) loadDatabasePath(path string) (worksheet, error) {
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return worksheet{}, err
+	}
+	databaseURL := (&url.URL{Scheme: "file", Path: absolutePath}).String() + "?mode=ro"
+	database, err := openSQLiteDatabase(databaseURL, false)
+	if err != nil {
+		return worksheet{}, err
+	}
+	var integrity string
+	if err := database.QueryRow("PRAGMA integrity_check").Scan(&integrity); err != nil {
+		_ = database.Close()
+		return worksheet{}, fmt.Errorf("check SQLite integrity: %w", err)
+	}
+	if integrity != "ok" {
+		_ = database.Close()
+		return worksheet{}, fmt.Errorf("SQLite integrity check failed: %s", integrity)
+	}
+	return store.loadFromDatabase(database)
+}
+
+func createSQLiteBackup(database *sql.DB, destination string) error {
+	connection, err := database.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	return connection.Raw(func(driverConnection any) error {
+		backuper, ok := driverConnection.(sqliteBackuper)
+		if !ok {
+			return errors.New("SQLite driver does not support consistent backup")
+		}
+		backup, err := backuper.NewBackup(destination)
+		if err != nil {
+			return err
+		}
+		for more := true; more; {
+			more, err = backup.Step(-1)
+			if err != nil {
+				_ = backup.Finish()
+				return err
+			}
+		}
+		return backup.Finish()
+	})
+}
+
+func (store worksheetStore) restorePrimaryFromBackup() error {
+	if err := store.createValidatedCopy(store.backupPath, store.databasePath, store.directory); err != nil {
+		return fmt.Errorf("restore Worksheet from backup: %w", err)
+	}
+	return nil
+}
+
+func (store worksheetStore) openDatabasePathReadOnly(path string) (*sql.DB, error) {
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	databaseURL := (&url.URL{Scheme: "file", Path: absolutePath}).String() + "?mode=ro"
+	return openSQLiteDatabase(databaseURL, false)
+}
+
+func (store worksheetStore) preserveCorruptPrimary() (string, error) {
+	artifactPath, err := linkTimestampedArtifact(store.databasePath, store.directory, "worksheet.corrupt-", ".sqlite")
+	if err != nil {
+		return "", err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		source := store.databasePath + suffix
+		if _, err := os.Lstat(source); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return "", err
+		}
+		if err := os.Link(source, artifactPath+suffix); err != nil {
+			return "", err
+		}
+		if err := os.Remove(source); err != nil {
+			return "", err
+		}
+	}
+	if err := os.Remove(store.databasePath); err != nil {
+		return "", err
+	}
+	if err := syncDirectory(store.directory); err != nil {
+		return "", err
+	}
+	return artifactPath, nil
+}
+
+func (store worksheetStore) preserveOrphanedPrimarySidecars() error {
+	var existing []string
+	for _, suffix := range []string{"-wal", "-shm"} {
+		path := store.databasePath + suffix
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		existing = append(existing, suffix)
+	}
+	if len(existing) == 0 {
+		return nil
+	}
+	firstSuffix := existing[0]
+	firstArtifact, err := linkTimestampedArtifact(store.databasePath+firstSuffix, store.directory, "worksheet.interrupted-", ".sqlite"+firstSuffix)
+	if err != nil {
+		return err
+	}
+	artifactPath := strings.TrimSuffix(firstArtifact, firstSuffix)
+	if err := os.Remove(store.databasePath + firstSuffix); err != nil {
+		return err
+	}
+	for _, suffix := range existing[1:] {
+		if err := os.Link(store.databasePath+suffix, artifactPath+suffix); err != nil {
+			return err
+		}
+		if err := os.Remove(store.databasePath + suffix); err != nil {
+			return err
+		}
+	}
+	return syncDirectory(store.directory)
+}
+
+func linkTimestampedArtifact(sourcePath, directory, prefix, extension string) (string, error) {
+	timestamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	for collision := 0; ; collision++ {
+		name := fmt.Sprintf("%s%s-%06d%s", prefix, timestamp, collision, extension)
+		path := filepath.Join(directory, name)
+		if err := os.Link(sourcePath, path); errors.Is(err, os.ErrExist) {
+			continue
+		} else if err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+}
+
+func syncRegularFile(path string) error {
+	file, err := openOwnerOnlyFile(path, unix.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func decodeWorksheetUndo(encoded []byte) (*worksheetUndo, error) {
@@ -612,19 +915,100 @@ func (store worksheetStore) protectDatabaseArtifacts() error {
 }
 
 func (store worksheetStore) reset() error {
-	artifacts, err := filepath.Glob(store.databasePath + "*")
+	if _, err := store.loadDatabasePath(store.databasePath); err != nil {
+		return fmt.Errorf("refuse to archive invalid Worksheet Database: %w", err)
+	}
+	archiveDirectory := filepath.Join(store.directory, "archive")
+	if err := ensureOwnerOnlyDirectory(archiveDirectory); err != nil {
+		return fmt.Errorf("prepare Worksheet archive directory: %w", err)
+	}
+	if _, err := store.createTimestampedValidatedCopy(store.databasePath, archiveDirectory, "", ".sqlite"); err != nil {
+		return fmt.Errorf("archive Worksheet Database: %w", err)
+	}
+	if err := removeDatabaseArtifacts(store.backupPath); err != nil {
+		return fmt.Errorf("remove reset Worksheet backup: %w", err)
+	}
+	if err := removeDatabaseArtifacts(store.databasePath); err != nil {
+		return fmt.Errorf("remove reset Worksheet Database: %w", err)
+	}
+	return syncDirectory(store.directory)
+}
+
+func (store worksheetStore) createValidatedCopy(sourcePath, destinationPath, destinationDirectory string) (finalErr error) {
+	database, err := store.openDatabasePathReadOnly(sourcePath)
 	if err != nil {
-		return fmt.Errorf("find Worksheet Database artifacts: %w", err)
+		return err
+	}
+	defer database.Close()
+	return store.installValidatedSnapshot(database, destinationPath, destinationDirectory, ".worksheet-copy-*.sqlite")
+}
+
+func (store worksheetStore) createTimestampedValidatedCopy(sourcePath, destinationDirectory, prefix, extension string) (string, error) {
+	database, err := store.openDatabasePathReadOnly(sourcePath)
+	if err != nil {
+		return "", err
+	}
+	defer database.Close()
+	temporaryPath, err := store.createValidatedSnapshot(database, destinationDirectory, ".worksheet-archive-*.sqlite")
+	if err != nil {
+		return "", err
+	}
+	defer removeDatabaseArtifacts(temporaryPath)
+	timestamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	for collision := 0; ; collision++ {
+		name := fmt.Sprintf("%s%s-%06d%s", prefix, timestamp, collision, extension)
+		destinationPath := filepath.Join(destinationDirectory, name)
+		if err := os.Link(temporaryPath, destinationPath); errors.Is(err, os.ErrExist) {
+			continue
+		} else if err != nil {
+			return "", err
+		}
+		if err := syncDirectory(destinationDirectory); err != nil {
+			return "", err
+		}
+		return destinationPath, nil
+	}
+}
+
+func removeDatabaseSidecars(databasePath string) error {
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Remove(databasePath + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove SQLite sidecar %s: %w", databasePath+suffix, err)
+		}
+	}
+	return nil
+}
+
+func removeDatabaseArtifacts(databasePath string) error {
+	artifacts, err := filepath.Glob(databasePath + "*")
+	if err != nil {
+		return err
 	}
 	for _, artifact := range artifacts {
-		if info, err := os.Lstat(artifact); err == nil && info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("refuse symbolic link for Worksheet artifact %s", artifact)
-		} else if err != nil {
+		info, err := os.Lstat(artifact)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
 			return err
 		}
-		if err := os.Remove(artifact); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove Worksheet Database artifact %s: %w", artifact, err)
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refuse symbolic link for Worksheet artifact %s", artifact)
 		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("Worksheet artifact %s is not a regular file", artifact)
+		}
+	}
+	for _, artifact := range artifacts {
+		if artifact == databasePath {
+			continue
+		}
+		if err := os.Remove(artifact); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove Worksheet artifact %s: %w", artifact, err)
+		}
+	}
+	if err := os.Remove(databasePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove Worksheet artifact %s: %w", databasePath, err)
 	}
 	return nil
 }

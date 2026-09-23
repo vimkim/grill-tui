@@ -58,7 +58,8 @@ environment; `Ctrl-S` delivery is informational.
 
 - [ ] Press `Ctrl-R` once and confirm the Worksheet remains present. Press another key and confirm
       reset is disarmed. Press `Ctrl-R` twice within two seconds and confirm the primary and backup
-      state are removed and the starting-number prompt returns.
+      state are removed, a valid database appears under the selected Worksheet's `archive/`
+      directory, and the same-name starting-number prompt returns.
 - [ ] Set `NO_COLOR=1` and confirm selection, status, and errors remain understandable without
       color.
 - [ ] Shrink the terminal until the explicit small-terminal message appears, restore its size, and

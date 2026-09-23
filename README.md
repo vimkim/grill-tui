@@ -109,14 +109,18 @@ flags, point it at a small wrapper script.
 
 ## Where things are kept
 
-Answers, selection, and viewport live in `.grill-tui/worksheet.json` in the directory where you
-started the tool. A last-known-good copy is kept in `.grill-tui/worksheet.backup.json`; corrupt
-primary state is preserved if recovery is needed. The directory contains its own `.gitignore`,
-uses owner-only permissions, and is protected by a single-writer lock.
+Each Worksheet keeps its answers and interaction state in
+`.grill-data/<name>/worksheet.sqlite` in the directory where you started the tool. A validated
+SQLite backup is kept beside it as `worksheet.backup.sqlite`. If the primary is missing or
+corrupt, Grill TUI recovers from a valid backup while preserving corrupt primary bytes under a
+timestamped `worksheet.corrupt-*.sqlite` name. If neither database is usable, it stops with a
+repair message instead of creating an empty Worksheet. The data root contains its own
+`.gitignore`, uses owner-only permissions, and each Worksheet has its own single-writer lock.
 
 To start over safely, press `Ctrl-R` twice within two seconds. The first press only arms reset;
-any other key or expiry cancels it. Confirmation removes both primary and backup state and
-returns to the starting-number prompt.
+any other key or expiry cancels it. Confirmation saves a valid, timestamped database under
+`.grill-data/<name>/archive/`, removes the active primary and backup, retains every earlier
+archive, and returns to the starting-number prompt for the same Worksheet Name.
 
 Colors are used where the terminal supports them. Set `NO_COLOR` to turn them off.
 

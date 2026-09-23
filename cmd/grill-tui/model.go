@@ -167,14 +167,14 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				model.mode = startingNumberMode
 				model.startInput = ""
 				model.editInput = ""
-				model.status = "Worksheet reset; enter a positive starting number"
+				model.status = "Worksheet reset after archive; enter a positive starting number"
 				return model, nil
 			}
 			model.resetArmed = true
 			model.resetToken++
 			model.resetBy = now.Add(resetConfirmationWindow)
 			token := model.resetToken
-			model.status = fmt.Sprintf("Reset armed — press %s again within 2 seconds to discard this Worksheet", model.keymap.labels(actionReset))
+			model.status = fmt.Sprintf("Reset armed — press %s again within 2 seconds to archive and reset this Worksheet", model.keymap.labels(actionReset))
 			return model, tea.Tick(resetConfirmationWindow, func(time.Time) tea.Msg {
 				return resetExpiredMsg{token: token}
 			})
