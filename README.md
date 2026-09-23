@@ -43,9 +43,16 @@ AI just asked. Pass it directly to skip the prompt:
 grill-tui 12
 ```
 
-The worksheet belongs to the directory you started it from, so running it again in the same
-place picks up exactly where you left off. A supplied starting number is ignored once a
-worksheet exists, which means an absent-minded `grill-tui 1` cannot wipe your answers.
+The worksheet belongs to the directory you started it from. Reopening it reports the last
+answered number and asks where to resume; Enter continues after that answer (or at the first
+slot when the worksheet is empty). Supplying a starting number selects that slot directly:
+
+```sh
+grill-tui 12
+```
+
+Earlier answers remain editable, and choosing a number outside the current range expands the
+worksheet without replacing its answers.
 
 You get ten numbered slots to begin with. Answer the last one and another appears, so a
 long interview never runs out of room.

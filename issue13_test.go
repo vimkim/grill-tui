@@ -264,7 +264,7 @@ func TestNamedWorksheetsUseIndependentSQLiteDatabases(t *testing.T) {
 	assertPublicAnswers(t, worksheetDatabasePath(workingDir, "untitled"), map[int]string{12: "recommended"})
 	assertPublicAnswers(t, worksheetDatabasePath(workingDir, "abc"), map[int]string{20: "yes"})
 
-	reopened := startTerminal(t, workingDir, "--name", "abc")
+	reopened := startTerminal(t, workingDir, "--name", "abc", "21")
 	screen := reopened.waitForSelection(t, 21)
 	if !strings.Contains(screen, "20") || !strings.Contains(screen, "yes") {
 		t.Fatalf("named Worksheet did not reopen from SQLite:\n%s", screen)

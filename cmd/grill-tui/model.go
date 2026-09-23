@@ -42,6 +42,7 @@ type interactionMode uint8
 const (
 	normalMode interactionMode = iota
 	startingNumberMode
+	resumeNumberMode
 	inlineAnswerMode
 )
 
@@ -108,7 +109,7 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if size, ok := message.(tea.WindowSizeMsg); ok {
 		model.size = terminalSize{width: size.Width, height: size.Height}
-		if model.mode != startingNumberMode && !model.terminalTooSmall() {
+		if model.mode != startingNumberMode && model.mode != resumeNumberMode && !model.terminalTooSmall() {
 			model = model.ensureSelectionVisible(model.mode, model.status)
 		}
 		return model, nil
@@ -145,6 +146,9 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if model.mode == startingNumberMode {
 			return model.updateStartingNumber(key), nil
 		}
+		if model.mode == resumeNumberMode {
+			return model.updateResumeNumber(key), nil
+		}
 		if hasAction && action == actionHelp {
 			model.helpOpen = true
 			return model, nil
@@ -180,13 +184,13 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch action {
 		case actionClear:
-			selected := model.worksheet.Slots[model.worksheet.Selected]
-			if selected.Answer == "" {
-				model.status = fmt.Sprintf("Answer Slot %d is already empty", selected.Number)
+			selected := model.worksheet.Selected
+			if model.worksheet.answer(selected) == "" {
+				model.status = fmt.Sprintf("Answer Slot %d is already empty", selected)
 				return model, nil
 			}
 			candidate := model.worksheet.withClearedAnswer()
-			status := fmt.Sprintf("Answer Slot %d cleared", selected.Number)
+			status := fmt.Sprintf("Answer Slot %d cleared", selected)
 			return model.persistWorksheet(candidate, status, revealSelectedSlot), nil
 		case actionUndo:
 			if model.worksheet.Undo == nil {
@@ -200,7 +204,7 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return model, copyAnswerList(model.worksheet)
 		case actionInline:
 			model.mode = inlineAnswerMode
-			model.editInput = model.worksheet.Slots[model.worksheet.Selected].Answer
+			model.editInput = model.worksheet.answer(model.worksheet.Selected)
 			model.status = "Editing Custom Answer inline"
 			return model, nil
 		case actionExternal:
@@ -269,7 +273,12 @@ func (model worksheetModel) updateStartingNumber(key tea.KeyMsg) worksheetModel 
 		model.startInput = ""
 		model.status = "Worksheet created"
 		return model
-	case "backspace":
+	}
+	return model.updateNumberInput(key)
+}
+
+func (model worksheetModel) updateNumberInput(key tea.KeyMsg) worksheetModel {
+	if key.String() == "backspace" {
 		if len(model.startInput) > 0 {
 			model.startInput = model.startInput[:len(model.startInput)-1]
 		}
@@ -290,6 +299,27 @@ func (model worksheetModel) updateStartingNumber(key tea.KeyMsg) worksheetModel 
 	return model
 }
 
+func (model worksheetModel) updateResumeNumber(key tea.KeyMsg) worksheetModel {
+	switch key.String() {
+	case "enter":
+		start := model.worksheet.defaultResumeNumber()
+		var err error
+		if model.startInput != "" {
+			start, err = parsePositiveNumber(model.startInput)
+		}
+		if err != nil {
+			model.startInput = ""
+			model.status = "Starting number must be a positive integer. Try again."
+			return model
+		}
+		candidate := model.worksheet.expandAndSelect(start)
+		model.mode = normalMode
+		model.startInput = ""
+		return model.persistWorksheet(candidate, "Worksheet resumed", revealSelectedSlot)
+	}
+	return model.updateNumberInput(key)
+}
+
 func (model worksheetModel) openExternalEditor() (worksheetModel, tea.Cmd) {
 	editor := os.Getenv("VISUAL")
 	if editor == "" {
@@ -306,7 +336,7 @@ func (model worksheetModel) openExternalEditor() (worksheetModel, tea.Cmd) {
 		return model, nil
 	}
 	draftPath := draft.Name()
-	answer := model.worksheet.Slots[model.worksheet.Selected].Answer
+	answer := model.worksheet.answer(model.worksheet.Selected)
 	if _, err := draft.WriteString(answer); err != nil {
 		_ = draft.Close()
 		_ = os.Remove(draftPath)
@@ -347,12 +377,13 @@ func (model worksheetModel) handleMouse(mouse tea.MouseEvent) worksheetModel {
 		if mouse.Action != tea.MouseActionPress {
 			return model
 		}
-		index := model.worksheet.Viewport + mouse.Y - gridFirstRow
-		if index < model.worksheet.Viewport || index >= len(model.worksheet.Slots) || index >= model.worksheet.Viewport+model.visibleAnswerSlots() {
+		rowOffset := mouse.Y - gridFirstRow
+		if rowOffset < 0 || rowOffset >= model.visibleAnswerSlots() || rowOffset > model.worksheet.LastNumber-model.worksheet.Viewport {
 			return model
 		}
+		number := model.worksheet.Viewport + rowOffset
 		candidate := model.worksheet
-		candidate.Selected = index
+		candidate.Selected = number
 		return model.persistWorksheet(candidate, "Answer Slot selected", revealSelectedSlot)
 	default:
 		return model
@@ -360,8 +391,19 @@ func (model worksheetModel) handleMouse(mouse tea.MouseEvent) worksheetModel {
 }
 
 func (model worksheetModel) scrollViewport(change int) worksheetModel {
-	maximumViewport := max(0, len(model.worksheet.Slots)-model.visibleAnswerSlots())
-	viewport := max(0, min(maximumViewport, model.worksheet.Viewport+change))
+	maximumViewport := max(model.worksheet.FirstNumber, model.worksheet.LastNumber-model.visibleAnswerSlots()+1)
+	viewport := model.worksheet.Viewport
+	if change < 0 {
+		if change < model.worksheet.FirstNumber-viewport {
+			viewport = model.worksheet.FirstNumber
+		} else {
+			viewport += change
+		}
+	} else if change > maximumViewport-viewport {
+		viewport = maximumViewport
+	} else {
+		viewport += change
+	}
 	if viewport == model.worksheet.Viewport {
 		return model
 	}
@@ -371,11 +413,7 @@ func (model worksheetModel) scrollViewport(change int) worksheetModel {
 }
 
 func (model worksheetModel) commitAnswer(answer, successStatus string) worksheetModel {
-	candidate, err := model.worksheet.withCommittedAnswer(answer)
-	if err != nil {
-		model.status = fmt.Sprintf("Could not grow Worksheet: %v", err)
-		return model
-	}
+	candidate := model.worksheet.withCommittedAnswer(answer)
 	return model.persistWorksheet(candidate, successStatus, revealSelectedSlot)
 }
 
@@ -415,7 +453,7 @@ func (model worksheetModel) View() string {
 	if model.terminalTooSmall() {
 		return model.smallTerminalView()
 	}
-	if model.mode == startingNumberMode {
+	if model.mode == startingNumberMode || model.mode == resumeNumberMode {
 		return model.promptView()
 	}
 	return model.worksheetView()
@@ -423,6 +461,20 @@ func (model worksheetModel) View() string {
 
 func (model worksheetModel) promptView() string {
 	var view strings.Builder
+	if model.mode == resumeNumberMode {
+		view.WriteString(model.styled(headingStyle, "Grill TUI — Resume Worksheet") + "\n\n")
+		lastAnswered, answered := model.worksheet.lastAnsweredNumber()
+		last := "none"
+		if answered {
+			last = strconv.Itoa(lastAnswered)
+		}
+		fmt.Fprintf(&view, "Last answered: %s. Start at [%d]: %s\n", last, model.worksheet.defaultResumeNumber(), model.startInput)
+		if model.status != "" {
+			fmt.Fprintf(&view, "\n%s\n", runewidth.Wrap("Status: "+model.status, model.size.width))
+		}
+		fmt.Fprintf(&view, "\nHelp: Enter resume • %s quit\n", model.keymap.labels(actionQuit))
+		return strings.TrimSuffix(view.String(), "\n")
+	}
 	view.WriteString(model.styled(headingStyle, "Grill TUI — Create a Worksheet") + "\n\n")
 	view.WriteString("Enter a positive starting number.\n")
 	fmt.Fprintf(&view, "Starting number: %s\n", model.startInput)
@@ -439,28 +491,31 @@ func (model worksheetModel) worksheetView() string {
 	}
 	var view strings.Builder
 	view.WriteString(model.styled(headingStyle, "Grill TUI — Worksheet") + "\n\n")
-	fmt.Fprintf(&view, "%d Answer Slots\n", len(model.worksheet.Slots))
+	fmt.Fprintf(&view, "%d Answer Slots\n", model.worksheet.slotCount())
 	view.WriteString("   No. │ Answer\n")
 	view.WriteString("───────┼────────────────────────────────────────\n")
-	lastVisible := min(model.worksheet.Viewport+model.visibleAnswerSlots(), len(model.worksheet.Slots))
+	visibleCount := min(model.visibleAnswerSlots(), model.worksheet.LastNumber-model.worksheet.Viewport+1)
+	lastVisible := model.worksheet.Viewport + visibleCount - 1
 	answerWidth := model.gridAnswerDisplayWidth(lastVisible)
-	for index := model.worksheet.Viewport; index < lastVisible; index++ {
-		slot := model.worksheet.Slots[index]
+	for number := model.worksheet.Viewport; number <= lastVisible; number++ {
 		marker := " "
-		if index == model.worksheet.Selected {
+		if number == model.worksheet.Selected {
 			marker = ">"
 		}
-		line := fmt.Sprintf("%s %d │ %s", marker, slot.Number, truncateGridAnswer(slot.Answer, answerWidth))
-		if index == model.worksheet.Selected {
+		line := fmt.Sprintf("%s %d │ %s", marker, number, truncateGridAnswer(model.worksheet.answer(number), answerWidth))
+		if number == model.worksheet.Selected {
 			line = model.styled(selectedStyle, line)
 		}
 		view.WriteString(line + "\n")
+		if number == lastVisible {
+			break
+		}
 	}
-	selected := model.worksheet.Slots[model.worksheet.Selected]
+	selected := model.worksheet.Selected
 	preview := selectedPreview(model.worksheet)
-	fmt.Fprintf(&view, "\nSelected Answer %d (full):\n%s\n", selected.Number, runewidth.Wrap(preview, model.size.width))
+	fmt.Fprintf(&view, "\nSelected Answer %d (full):\n%s\n", selected, runewidth.Wrap(preview, model.size.width))
 	if model.mode == inlineAnswerMode {
-		prefix := fmt.Sprintf("Inline Custom Answer %d: ", selected.Number)
+		prefix := fmt.Sprintf("Inline Custom Answer %d: ", selected)
 		inputWidth := max(1, model.size.width-runewidth.StringWidth(prefix))
 		fmt.Fprintf(&view, "\n%s%s\n", prefix, runewidth.Truncate(singleLineAnswer(model.editInput), inputWidth, "…"))
 		view.WriteString("Help: Enter commit • Esc cancel\n")
@@ -501,8 +556,11 @@ func (model worksheetModel) smallTerminalView() string {
 	if model.mode == startingNumberMode {
 		return model.renderSmallTerminalView("Please resize to create a Worksheet.", "No Worksheet has been created yet.")
 	}
-	selected := model.worksheet.Slots[model.worksheet.Selected]
-	assurance := fmt.Sprintf("Selected Answer Slot %d remains selected.\nWorksheet data is safe.", selected.Number)
+	if model.mode == resumeNumberMode {
+		return model.renderSmallTerminalView("Please resize to resume the Worksheet.", "Worksheet data is safe.")
+	}
+	selected := model.worksheet.Selected
+	assurance := fmt.Sprintf("Selected Answer Slot %d remains selected.\nWorksheet data is safe.", selected)
 	return model.renderSmallTerminalView("Please resize to return to the Worksheet.", assurance)
 }
 
@@ -521,8 +579,7 @@ func (model worksheetModel) styled(code, text string) string {
 }
 
 func (model worksheetModel) gridAnswerDisplayWidth(lastVisible int) int {
-	lastNumber := model.worksheet.Slots[lastVisible-1].Number
-	prefixWidth := runewidth.StringWidth(strconv.Itoa(lastNumber)) + 5
+	prefixWidth := runewidth.StringWidth(strconv.Itoa(lastVisible)) + 5
 	return max(1, min(gridAnswerWidth, model.size.width-prefixWidth))
 }
 
@@ -535,7 +592,7 @@ func singleLineAnswer(answer string) string {
 }
 
 func selectedPreview(storedWorksheet worksheet) string {
-	preview := storedWorksheet.Slots[storedWorksheet.Selected].Answer
+	preview := storedWorksheet.answer(storedWorksheet.Selected)
 	if preview == "" {
 		return "(empty)"
 	}

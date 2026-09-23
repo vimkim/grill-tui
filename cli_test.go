@@ -130,7 +130,7 @@ func TestWorksheetAllowsOnlyOneWriterProcess(t *testing.T) {
 	owner.send(t, "q")
 	owner.waitForExit(t)
 
-	resumed := startTerminal(t, workingDir)
+	resumed := startTerminal(t, workingDir, "71")
 	screen = resumed.waitForSelection(t, 71)
 	if !strings.Contains(screen, "  70 │ recommended") {
 		t.Fatalf("Worksheet was damaged by competing process:\n%s", screen)
@@ -324,35 +324,27 @@ func TestPromptRejectsStartThatCannotFitTenConsecutiveSlots(t *testing.T) {
 	}
 }
 
-func TestExistingWorksheetResumesAndWinsOverSuppliedStart(t *testing.T) {
+func TestExistingWorksheetUsesSuppliedStartWithoutReplacingItsRange(t *testing.T) {
 	workingDir := t.TempDir()
 	firstRun := startTerminal(t, workingDir, "22")
 	firstRun.send(t, "q")
 	firstRun.waitForExit(t)
 
-	statePath := worksheetDatabasePath(workingDir, "untitled")
-	beforeResume, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatalf("read Worksheet before resuming: %v", err)
-	}
-
 	resumed := startTerminal(t, workingDir, "99")
-	screen := resumed.waitFor(t, "10 Answer Slots")
-	if !strings.Contains(screen, "> 22") || !strings.Contains(screen, "31") {
-		t.Fatalf("existing Worksheet was not resumed:\n%s", screen)
-	}
-	if strings.Contains(screen, "99") {
-		t.Fatalf("supplied start replaced the existing Worksheet:\n%s", screen)
+	screen := resumed.waitForSelection(t, 99)
+	if strings.Contains(screen, "Last answered:") {
+		t.Fatalf("supplied start showed the resume prompt:\n%s", screen)
 	}
 	resumed.send(t, "q")
 	resumed.waitForExit(t)
 
-	afterResume, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatalf("read Worksheet after resuming: %v", err)
+	database := openWorksheetDatabaseReadOnly(t, worksheetDatabasePath(workingDir, "untitled"))
+	var firstNumber, lastNumber int
+	if err := database.QueryRow("SELECT first_number, last_number FROM worksheet_info").Scan(&firstNumber, &lastNumber); err != nil {
+		t.Fatalf("query resumed Worksheet range: %v", err)
 	}
-	if !bytes.Equal(afterResume, beforeResume) {
-		t.Fatalf("resuming with a supplied start changed the Worksheet\nbefore: %s\nafter: %s", beforeResume, afterResume)
+	if firstNumber != 22 || lastNumber != 99 {
+		t.Fatalf("resumed Worksheet range = %d-%d, want 22-99", firstNumber, lastNumber)
 	}
 }
 
@@ -406,8 +398,9 @@ func TestConfiguredBindingsDriveActionsAndEffectiveHelp(t *testing.T) {
 	if strings.Contains(help, "↓/j/Ctrl-N") {
 		t.Fatalf("complete help still claims removed movement bindings are active:\n%s", help)
 	}
+	mark = len(terminal.output.String())
 	terminal.send(t, "?")
-	terminal.waitForSelection(t, 7)
+	terminal.waitForAfter(t, mark, "Selected Answer 7 (full):")
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 }
@@ -715,7 +708,7 @@ func TestResizeShowsSmallTerminalStateAndRestoresWorksheet(t *testing.T) {
 
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
-	resumed := startTerminal(t, workingDir)
+	resumed := startTerminal(t, workingDir, "14")
 	resumed.waitForSelection(t, 14)
 	resumed.send(t, "q")
 	resumed.waitForExit(t)
@@ -872,7 +865,7 @@ func TestSupportedWidthReflowsLongContentWithoutLosingPreview(t *testing.T) {
 	workingDir := t.TempDir()
 	longAnswer := "wide " + strings.Repeat("界", 30)
 	installWorksheetFixture(t, workingDir, filepath.Join("testdata", "long-answer-worksheet.json"))
-	terminal := startTerminal(t, workingDir)
+	terminal := startTerminal(t, workingDir, "20")
 
 	mark := len(terminal.output.String())
 	terminal.resize(t, 50, 24)
@@ -900,7 +893,7 @@ func TestMouseClickSelectsAnswerSlotAndPersistsSelection(t *testing.T) {
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
-	resumed := startTerminal(t, workingDir)
+	resumed := startTerminal(t, workingDir, "8")
 	resumed.waitForSelection(t, 8)
 	resumed.send(t, "q")
 	resumed.waitForExit(t)
@@ -1133,7 +1126,7 @@ func TestSpaceAdvancesWithoutEditingOrGrowingWorksheet(t *testing.T) {
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
-	resumed := startTerminal(t, workingDir)
+	resumed := startTerminal(t, workingDir, "17")
 	resumed.waitForSelection(t, 17)
 	resumed.send(t, "q")
 	resumed.waitForExit(t)
@@ -1247,7 +1240,7 @@ func TestNormalModeEscapeClearsSelectedAnswerAndPersists(t *testing.T) {
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
-	resumed := startTerminal(t, workingDir)
+	resumed := startTerminal(t, workingDir, "30")
 	screen = resumed.waitForSelection(t, 30)
 	if answer := latestRenderedAnswer(t, screen, 30); answer != "" {
 		t.Fatalf("cleared Answer Slot contains %q after restart, want empty:\n%s", answer, screen)
@@ -1283,7 +1276,7 @@ func TestUndoPresetCommitAfterNavigationAndRestartRestoresAffectedSlot(t *testin
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
-	resumed := startTerminal(t, workingDir)
+	resumed := startTerminal(t, workingDir, "32")
 	resumed.waitForSelection(t, 32)
 	assertUndoRestoresAnswer(t, resumed, 30, "")
 
@@ -1377,7 +1370,7 @@ func TestUndoFinalSlotCommitRemovesAppendedSlot(t *testing.T) {
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
-	resumed := startTerminal(t, workingDir)
+	resumed := startTerminal(t, workingDir, "39")
 	screen := resumed.waitForSelection(t, 39)
 	if !strings.Contains(screen, "10 Answer Slots") {
 		t.Fatalf("undo did not remove the appended Answer Slot:\n%s", screen)
@@ -1409,7 +1402,7 @@ func TestInlineCustomAnswerCommitAutoAdvancesGrowsAndSurvivesResume(t *testing.T
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
-	resumed := startTerminal(t, workingDir)
+	resumed := startTerminal(t, workingDir, "100")
 	resumed.waitForSelection(t, 100)
 	resumed.send(t, "k")
 	screen = resumed.waitFor(t, "Selected Answer 99 (full):\nshort custom answer")
@@ -1489,7 +1482,7 @@ printf 'wrong editor' > "$1"
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
-	resumed := startTerminal(t, workingDir)
+	resumed := startTerminal(t, workingDir, "30")
 	screen = resumed.waitFor(t, "Selected Answer 30 (full):\nfirst line\nsecond 界 line")
 	if !strings.Contains(screen, "> 30 │ first line second 界 line") {
 		t.Fatalf("multiline Custom Answer did not survive resume:\n%s", screen)
@@ -1614,7 +1607,7 @@ func TestFinalPresetCommitGrowsAndScrollsWorksheetAndResumeRestoresPosition(t *t
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
-	resumedAtEnd := startTerminal(t, workingDir)
+	resumedAtEnd := startTerminal(t, workingDir, "11")
 	resumedAtEnd.waitForSelection(t, 11)
 	screen := resumedAtEnd.waitFor(t, "Selected Answer 11 (full):")
 	assertVisibleAnswerSlotRange(t, screen, 2, 11)
@@ -1634,7 +1627,7 @@ func TestFinalPresetCommitGrowsAndScrollsWorksheetAndResumeRestoresPosition(t *t
 	resumedAtEnd.send(t, "q")
 	resumedAtEnd.waitForExit(t)
 
-	resumedAtStart := startTerminal(t, workingDir)
+	resumedAtStart := startTerminal(t, workingDir, "1")
 	resumedAtStart.waitForSelection(t, 1)
 	screen = resumedAtStart.waitFor(t, "Selected Answer 1 (full):")
 	assertVisibleAnswerSlotRange(t, screen, 1, 10)
@@ -1650,7 +1643,7 @@ func TestFinalPresetCommitGrowsAndScrollsWorksheetAndResumeRestoresPosition(t *t
 	resumedAtStart.send(t, "q")
 	resumedAtStart.waitForExit(t)
 
-	resumedAfterNavigation := startTerminal(t, workingDir)
+	resumedAfterNavigation := startTerminal(t, workingDir, "11")
 	resumedAfterNavigation.waitForSelection(t, 11)
 	screen = resumedAfterNavigation.waitFor(t, "Selected Answer 11 (full):")
 	if !strings.Contains(screen, "11 Answer Slots") {
@@ -1697,7 +1690,7 @@ func TestLongAnswerIsTruncatedInGridAndShownInFullPreview(t *testing.T) {
 	longAnswer := "wide " + strings.Repeat("界", 30)
 	installWorksheetFixture(t, workingDir, filepath.Join("testdata", "long-answer-worksheet.json"))
 
-	terminal := startTerminal(t, workingDir)
+	terminal := startTerminal(t, workingDir, "20")
 	screen := terminal.waitFor(t, longAnswer)
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
@@ -1730,7 +1723,7 @@ func TestSCopiesExactAnswerListToWaylandClipboard(t *testing.T) {
 		"PATH":            fixtureDir,
 		"WAYLAND_DISPLAY": "wayland-test",
 		"CAPTURE":         capturePath,
-	}})
+	}}, "998")
 	copyAndExit(t, terminal, "s", "Answer List copied")
 
 	copied, err := os.ReadFile(capturePath)
@@ -1805,7 +1798,7 @@ func TestWSLClipboardTakesPrecedenceAndReceivesUTF16LEWithCRLF(t *testing.T) {
 		"WAYLAND_DISPLAY": "wayland-test",
 		"CLIP_CAPTURE":    clipCapture,
 		"WAYLAND_CAPTURE": waylandCapture,
-	}})
+	}}, "998")
 	copyAndExit(t, terminal, "s", "Answer List copied using clip.exe")
 
 	copied, err := os.ReadFile(clipCapture)
@@ -1839,7 +1832,7 @@ func TestClipboardFailureFallsBackToNextEnvironmentBackend(t *testing.T) {
 		"WSL_DISTRO_NAME": "Test Linux",
 		"WAYLAND_DISPLAY": "wayland-test",
 		"WAYLAND_CAPTURE": waylandCapture,
-	}})
+	}}, "998")
 	copyAndExit(t, terminal, "s", "Answer List copied using wl-copy")
 
 	copied, err := os.ReadFile(waylandCapture)
@@ -1867,7 +1860,7 @@ func TestClipboardLaunchFailureFallsBackToNextEnvironmentBackend(t *testing.T) {
 			"XCLIP_CAPTURE":   xclipCapture,
 		},
 		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP"},
-	})
+	}, "998")
 	copyAndExit(t, terminal, "s", "Answer List copied using xclip")
 
 	copied, err := os.ReadFile(xclipCapture)
@@ -1897,7 +1890,7 @@ func TestClipboardWriteFailureFallsBackToNextEnvironmentBackend(t *testing.T) {
 			"XCLIP_CAPTURE":   xclipCapture,
 		},
 		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP"},
-	})
+	}, "2")
 	copyAndExit(t, terminal, "s", "Answer List copied using xclip")
 
 	copied, err := os.ReadFile(xclipCapture)
@@ -1929,7 +1922,7 @@ func TestX11ClipboardPrefersXclipWithClipboardSelection(t *testing.T) {
 			"XSEL_CAPTURE":  xselCapture,
 		},
 		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP", "WAYLAND_DISPLAY"},
-	})
+	}, "998")
 	copyAndExit(t, terminal, "s", "Answer List copied using xclip")
 
 	copied, err := os.ReadFile(xclipCapture)
@@ -1968,7 +1961,7 @@ func TestX11ClipboardFallsBackFromXclipToXsel(t *testing.T) {
 			"ARGS_CAPTURE": argsCapture,
 		},
 		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP", "WAYLAND_DISPLAY"},
-	})
+	}, "998")
 	copyAndExit(t, terminal, "s", "Answer List copied using xsel")
 
 	copied, err := os.ReadFile(xselCapture)
@@ -1995,7 +1988,7 @@ func TestClipboardFallsBackToOSC52(t *testing.T) {
 		removed: []string{
 			"WSL_DISTRO_NAME", "WSL_INTEROP", "WAYLAND_DISPLAY", "DISPLAY",
 		},
-	})
+	}, "998")
 
 	copyAndExit(t, terminal, "s", "Answer List copied using OSC 52")
 
@@ -2023,7 +2016,7 @@ func TestWaylandClipboardTakesPrecedenceOverX11(t *testing.T) {
 			"XCLIP_CAPTURE":   xclipCapture,
 		},
 		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP"},
-	})
+	}, "998")
 	copyAndExit(t, terminal, "s", "Answer List copied using wl-copy")
 
 	if _, err := os.Stat(waylandCapture); err != nil {
@@ -2055,7 +2048,7 @@ func TestCopyFailureIsActionableAndLeavesWorksheetUnchanged(t *testing.T) {
 			"DISPLAY":         ":99",
 		},
 		removed: []string{"WSL_DISTRO_NAME", "WSL_INTEROP"},
-	})
+	}, "998")
 	terminal.send(t, "s")
 	screen := terminal.waitFor(t, "Could not copy Answer List: all backends failed")
 	if !strings.Contains(screen, "check clipboard tools or OSC 52 support") {

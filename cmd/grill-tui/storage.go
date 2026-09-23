@@ -183,8 +183,8 @@ SELECT slot_numbers.question_number,
   LEFT JOIN worksheet_answers USING (question_number);
 CREATE VIEW answered_questions(question_number, answer) AS
 SELECT question_number, answer
-  FROM answer_slots
- WHERE is_answered = 1;
+  FROM worksheet_answers
+ WHERE answer <> '';
 CREATE VIEW worksheet_info(
     worksheet_name,
     first_number,
@@ -230,18 +230,13 @@ SELECT worksheet_name, first_number, last_number, selected_index, viewport_index
 	if firstNumber < 1 || lastNumber < firstNumber {
 		return worksheet{}, fmt.Errorf("Worksheet Database has invalid range %d-%d", firstNumber, lastNumber)
 	}
-	slotCount := lastNumber - firstNumber + 1
-	if slotCount <= 0 {
-		return worksheet{}, errors.New("Worksheet Database range is too large")
-	}
 	storedWorksheet := worksheet{
 		SchemaVersion: worksheetSchemaVersion,
-		Slots:         make([]answerSlot, slotCount),
-		Selected:      selected,
-		Viewport:      viewport,
-	}
-	for index := range storedWorksheet.Slots {
-		storedWorksheet.Slots[index].Number = firstNumber + index
+		FirstNumber:   firstNumber,
+		LastNumber:    lastNumber,
+		Answers:       make(map[int]string),
+		Selected:      firstNumber + selected,
+		Viewport:      firstNumber + viewport,
 	}
 	rows, err := database.Query("SELECT question_number, answer FROM worksheet_answers ORDER BY question_number")
 	if err != nil {
@@ -254,21 +249,22 @@ SELECT worksheet_name, first_number, last_number, selected_index, viewport_index
 		if err := rows.Scan(&number, &answer); err != nil {
 			return worksheet{}, fmt.Errorf("read Worksheet answer: %w", err)
 		}
-		index := number - firstNumber
-		if index < 0 || index >= len(storedWorksheet.Slots) {
+		if number < firstNumber || number > lastNumber {
 			return worksheet{}, fmt.Errorf("Worksheet answer %d is outside range %d-%d", number, firstNumber, lastNumber)
 		}
-		storedWorksheet.Slots[index].Answer = answer
+		if answer != "" {
+			storedWorksheet.Answers[number] = answer
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return worksheet{}, fmt.Errorf("read Worksheet answers: %w", err)
 	}
 	if encodedUndo.Valid {
-		var undo worksheetUndo
-		if err := json.Unmarshal([]byte(encodedUndo.String), &undo); err != nil {
+		undo, err := decodeWorksheetUndo([]byte(encodedUndo.String))
+		if err != nil {
 			return worksheet{}, fmt.Errorf("read Worksheet undo state: %w", err)
 		}
-		storedWorksheet.Undo = &undo
+		storedWorksheet.Undo = undo
 	}
 	if err := validateWorksheet(storedWorksheet); err != nil {
 		return worksheet{}, fmt.Errorf("validate Worksheet Database: %w", err)
@@ -309,8 +305,8 @@ func (store worksheetStore) save(storedWorksheet worksheet) error {
 		}
 		undo = string(encoded)
 	}
-	firstNumber := storedWorksheet.Slots[0].Number
-	lastNumber := storedWorksheet.Slots[len(storedWorksheet.Slots)-1].Number
+	firstNumber := storedWorksheet.FirstNumber
+	lastNumber := storedWorksheet.LastNumber
 	_, err = transaction.Exec(`
 INSERT INTO worksheet_state (
     singleton, worksheet_name, first_number, last_number,
@@ -324,8 +320,8 @@ ON CONFLICT(singleton) DO UPDATE SET
     viewport_index = excluded.viewport_index,
     undo_state = excluded.undo_state,
     updated_at = excluded.updated_at`,
-		string(store.name), firstNumber, lastNumber, storedWorksheet.Selected,
-		storedWorksheet.Viewport, undo, time.Now().UTC().Format(time.RFC3339Nano))
+		string(store.name), firstNumber, lastNumber, storedWorksheet.Selected-firstNumber,
+		storedWorksheet.Viewport-firstNumber, undo, time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("save Worksheet metadata: %w", err)
 	}
@@ -337,9 +333,9 @@ ON CONFLICT(singleton) DO UPDATE SET
 		return fmt.Errorf("prepare Worksheet answers: %w", err)
 	}
 	defer statement.Close()
-	for _, slot := range storedWorksheet.Slots {
-		if _, err := statement.Exec(slot.Number, slot.Answer); err != nil {
-			return fmt.Errorf("save Answer Slot %d: %w", slot.Number, err)
+	for number, answer := range storedWorksheet.Answers {
+		if _, err := statement.Exec(number, answer); err != nil {
+			return fmt.Errorf("save Answer Slot %d: %w", number, err)
 		}
 	}
 	if err := statement.Close(); err != nil {
@@ -349,6 +345,44 @@ ON CONFLICT(singleton) DO UPDATE SET
 		return fmt.Errorf("commit Worksheet save: %w", err)
 	}
 	return store.protectDatabaseArtifacts()
+}
+
+func decodeWorksheetUndo(encoded []byte) (*worksheetUndo, error) {
+	var undo worksheetUndo
+	if err := json.Unmarshal(encoded, &undo); err != nil {
+		return nil, err
+	}
+	if undo.FirstNumber > 0 {
+		if undo.Answers == nil {
+			undo.Answers = make(map[int]string)
+		}
+		return &undo, nil
+	}
+
+	var legacy struct {
+		Slots    []answerSlot `json:"slots"`
+		Selected int          `json:"selected"`
+		Viewport int          `json:"viewport"`
+	}
+	if err := json.Unmarshal(encoded, &legacy); err != nil {
+		return nil, err
+	}
+	if len(legacy.Slots) == 0 {
+		return nil, errors.New("undo state has no Answer Slots")
+	}
+	undo = worksheetUndo{
+		FirstNumber: legacy.Slots[0].Number,
+		LastNumber:  legacy.Slots[len(legacy.Slots)-1].Number,
+		Answers:     make(map[int]string),
+		Selected:    legacy.Slots[0].Number + legacy.Selected,
+		Viewport:    legacy.Slots[0].Number + legacy.Viewport,
+	}
+	for _, slot := range legacy.Slots {
+		if slot.Answer != "" {
+			undo.Answers[slot.Number] = slot.Answer
+		}
+	}
+	return &undo, nil
 }
 
 func (store worksheetStore) openExistingDatabase() (*sql.DB, error) {

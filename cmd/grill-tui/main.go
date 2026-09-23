@@ -54,9 +54,25 @@ func run(args []string) error {
 	}
 	existing, recoveryStatus, err := loadWorksheet()
 	if err == nil {
-		initialModel.mode = normalMode
 		initialModel.worksheet = existing
 		initialModel.status = recoveryStatus
+		if len(positional) == 0 {
+			initialModel.mode = resumeNumberMode
+		} else {
+			start, err := parsePositiveNumber(positional[0])
+			if err != nil {
+				return err
+			}
+			positioned := existing.expandAndSelect(start)
+			if positioned.FirstNumber != existing.FirstNumber || positioned.LastNumber != existing.LastNumber ||
+				positioned.Selected != existing.Selected || positioned.Viewport != existing.Viewport {
+				if err := saveWorksheet(positioned); err != nil {
+					return err
+				}
+			}
+			initialModel.mode = normalMode
+			initialModel.worksheet = positioned
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	} else if len(positional) == 1 {
