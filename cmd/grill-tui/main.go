@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"text/tabwriter"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -33,6 +35,9 @@ func run(args []string) error {
 	}
 	if len(args) > 0 && args[0] == "result" {
 		return runResultCommand(args[1:])
+	}
+	if len(args) > 0 && args[0] == "list" {
+		return runListCommand(args[1:])
 	}
 	name, positional, err := parseWorksheetSelection(args)
 	if err != nil {
@@ -97,6 +102,38 @@ func run(args []string) error {
 	program := tea.NewProgram(initialModel, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err = program.Run()
 	return err
+}
+
+func runListCommand(args []string) error {
+	if len(args) != 0 {
+		return errors.New("usage: grill-tui list")
+	}
+	worksheets, err := discoverWorksheets()
+	if err != nil {
+		return err
+	}
+	sort.Slice(worksheets, func(left, right int) bool {
+		if worksheets[left].updatedAt.Equal(worksheets[right].updatedAt) {
+			return worksheets[left].name < worksheets[right].name
+		}
+		return worksheets[left].updatedAt.After(worksheets[right].updatedAt)
+	})
+	output := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(output, "NAME\tRANGE\tANSWERED\tLAST\tUPDATED"); err != nil {
+		return err
+	}
+	for _, worksheet := range worksheets {
+		lastAnswered := "—"
+		if worksheet.lastAnswered.Valid {
+			lastAnswered = fmt.Sprint(worksheet.lastAnswered.Int64)
+		}
+		if _, err := fmt.Fprintf(output, "%s\t%d-%d\t%d\t%s\t%s\n",
+			worksheet.name, worksheet.firstNumber, worksheet.lastNumber,
+			worksheet.answeredCount, lastAnswered, worksheet.updatedText); err != nil {
+			return err
+		}
+	}
+	return output.Flush()
 }
 
 func runResultCommand(args []string) error {

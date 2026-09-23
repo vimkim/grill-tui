@@ -25,6 +25,16 @@ type worksheetStore struct {
 	databasePath string
 }
 
+type worksheetInfo struct {
+	name          worksheetName
+	firstNumber   int
+	lastNumber    int
+	lastAnswered  sql.NullInt64
+	answeredCount int
+	updatedAt     time.Time
+	updatedText   string
+}
+
 var activeWorksheetStore = newWorksheetStore(defaultWorksheetName)
 
 func selectWorksheetStorage(name worksheetName) {
@@ -38,6 +48,68 @@ func newWorksheetStore(name worksheetName) worksheetStore {
 		directory:    directory,
 		databasePath: filepath.Join(directory, worksheetDatabaseFile),
 	}
+}
+
+func discoverWorksheets() ([]worksheetInfo, error) {
+	entries, err := os.ReadDir(worksheetDataDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("discover Worksheets: %w", err)
+	}
+	worksheets := make([]worksheetInfo, 0, len(entries))
+	var unreadable []error
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() || !worksheetNamePattern.MatchString(name) {
+			continue
+		}
+		store := newWorksheetStore(worksheetName(name))
+		if _, err := os.Lstat(store.databasePath); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			unreadable = append(unreadable, fmt.Errorf("Worksheet %q: inspect live Worksheet Database: %w", name, err))
+			continue
+		}
+		info, err := store.readInfo()
+		if err != nil {
+			unreadable = append(unreadable, fmt.Errorf("Worksheet %q: read live Worksheet Database: %w", name, err))
+			continue
+		}
+		worksheets = append(worksheets, info)
+	}
+	if len(unreadable) != 0 {
+		return nil, fmt.Errorf("cannot list unreadable Worksheets:\n%w", errors.Join(unreadable...))
+	}
+	return worksheets, nil
+}
+
+func (store worksheetStore) readInfo() (worksheetInfo, error) {
+	database, err := store.openExistingReadOnlyDatabase()
+	if err != nil {
+		return worksheetInfo{}, err
+	}
+	defer database.Close()
+	if err := requireSupportedSchema(database); err != nil {
+		return worksheetInfo{}, err
+	}
+	var info worksheetInfo
+	var storedName string
+	if err := database.QueryRow(`
+SELECT worksheet_name, first_number, last_number, last_answered_number, answered_count, updated_at
+  FROM worksheet_info`).Scan(&storedName, &info.firstNumber, &info.lastNumber, &info.lastAnswered, &info.answeredCount, &info.updatedText); err != nil {
+		return worksheetInfo{}, fmt.Errorf("query public worksheet_info: %w", err)
+	}
+	if storedName != string(store.name) {
+		return worksheetInfo{}, fmt.Errorf("Worksheet Database records name %q, not directory name %q", storedName, store.name)
+	}
+	info.updatedAt, err = time.Parse(time.RFC3339Nano, info.updatedText)
+	if err != nil {
+		return worksheetInfo{}, fmt.Errorf("parse public worksheet_info updated_at %q: %w", info.updatedText, err)
+	}
+	info.name = store.name
+	return info, nil
 }
 
 func loadWorksheet() (worksheet, string, error) {
