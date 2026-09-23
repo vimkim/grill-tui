@@ -565,7 +565,7 @@ func TestRemappedPresetBindingsKeepTheirActionSemantics(t *testing.T) {
 	writeConfigFixture(t, configHome, `[keymap]
 recommended = ["z"]
 choice_upper_a = ["v"]
-explain = ["g"]
+explain = ["h"]
 `)
 	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{values: map[string]string{
 		"XDG_CONFIG_HOME": configHome,
@@ -578,7 +578,7 @@ explain = ["g"]
 	}{
 		{key: "z", number: 10, answer: "recommended"},
 		{key: "v", number: 11, answer: "A"},
-		{key: "g", number: 12, answer: "explain further"},
+		{key: "h", number: 12, answer: "explain further"},
 	} {
 		terminal.send(t, step.key)
 		screen := terminal.waitForSelection(t, step.number+1)

@@ -72,6 +72,7 @@ long interview never runs out of room.
 | Key | What it does |
 | --- | --- |
 | `↑` `↓`, `j` `k`, `Ctrl-N` `Ctrl-P` | Move between slots |
+| `g` `g` | Jump to the first Answer Slot |
 | `Space` | Skip without answering |
 | `r` `y` `n` | Answer `recommended`, `yes`, `no` |
 | `1`-`5` | Answer with that number |
@@ -111,6 +112,10 @@ names whichever one worked.
 
 Press `i` to edit the selected Answer Slot on one line. `Enter` commits and advances; `Esc`
 cancels the draft without changing the answer.
+
+These Insert Mode actions can be remapped separately from Normal Mode. A sequence prefix such
+as the first `g` in `gg` appears in the status line, expires after one second by default,
+and is cancelled if the next key does not match. That next key still performs its usual action.
 
 Press `o` to open the current answer in your editor, which is `$VISUAL` if set and `$EDITOR`
 otherwise. Save and exit successfully to commit and advance. An editor error leaves the Answer
@@ -158,9 +163,24 @@ move_down = ["z", "v"]
 quit = ["q"]
 ```
 
+Normal Mode bindings live under `[keymap]`, Insert Mode bindings under
+`[keymap.insert]`, and starting-number prompt bindings under `[keymap.prompt]`. A binding
+can be a single key (`"z"`), a contiguous sequence (`"gg"`), or a space-separated sequence
+of named keys (`"ctrl+x ctrl+y"`). Bindings in the same mode cannot be duplicates or
+prefixes of one another. To adjust the sequence window:
+
+```toml
+[input]
+sequence_timeout_ms = 1000 # 100–5000
+
+[keymap.insert]
+finish = ["enter", "ctrl+q"]
+```
+
 Help always shows the effective bindings, including actions intentionally set to `[]`.
 `quit` may omit `ctrl+c`, but it cannot be empty. `copy` must retain at least one route
-other than `ctrl+s`, since some terminals intercept that control key.
+other than `ctrl+s`, since some terminals intercept that control key. Insert Mode `finish`
+and prompt `submit` and `quit` must also retain at least one binding each.
 
 ## V1 platform boundary
 

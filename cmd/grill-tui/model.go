@@ -44,6 +44,7 @@ const (
 	startingNumberMode
 	resumeNumberMode
 	inlineAnswerMode
+	promptBindingsMode
 )
 
 type viewportPolicy uint8
@@ -54,18 +55,21 @@ const (
 )
 
 type worksheetModel struct {
-	worksheet  worksheet
-	mode       interactionMode
-	startInput string
-	editInput  string
-	status     string
-	size       terminalSize
-	helpOpen   bool
-	useColor   bool
-	resetArmed bool
-	resetToken uint64
-	resetBy    time.Time
-	keymap     keymap
+	worksheet     worksheet
+	mode          interactionMode
+	startInput    string
+	editInput     string
+	status        string
+	size          terminalSize
+	helpOpen      bool
+	useColor      bool
+	resetArmed    bool
+	resetToken    uint64
+	resetBy       time.Time
+	keymap        keymap
+	pendingKeys   []string
+	sequenceToken uint64
+	sequenceBy    time.Time
 }
 
 type externalEditorFinishedMsg struct {
@@ -74,6 +78,10 @@ type externalEditorFinishedMsg struct {
 }
 
 type resetExpiredMsg struct {
+	token uint64
+}
+
+type sequenceExpiredMsg struct {
 	token uint64
 }
 
@@ -100,6 +108,13 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return model, nil
 	}
+	if expired, ok := message.(sequenceExpiredMsg); ok {
+		if len(model.pendingKeys) != 0 && expired.token == model.sequenceToken {
+			model.clearSequence()
+			model.status = "Sequence expired"
+		}
+		return model, nil
+	}
 	if finished, ok := message.(externalEditorFinishedMsg); ok {
 		if finished.err != nil {
 			model.status = fmt.Sprintf("External editor failed; Answer Slot unchanged: %v", finished.err)
@@ -118,129 +133,223 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return model.handleMouse(tea.MouseEvent(mouse)), nil
 	}
 	if key, ok := message.(tea.KeyMsg); ok {
-		action, hasAction := model.keymap.actionFor(key.String())
-		if model.resetArmed && (!hasAction || action != actionReset) {
+		return model.handleKey(key)
+	}
+	return model, nil
+}
+
+func (model worksheetModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if len(key.Runes) > 1 {
+		var commands []tea.Cmd
+		for _, character := range key.Runes {
+			updated, command := model.handleKey(tea.KeyMsg{Type: key.Type, Runes: []rune{character}})
+			model = updated.(worksheetModel)
+			if command != nil {
+				commands = append(commands, command)
+			}
+		}
+		return model, tea.Batch(commands...)
+	}
+	if model.mode == startingNumberMode || model.mode == resumeNumberMode {
+		var action keyAction
+		var waiting bool
+		var command tea.Cmd
+		model, action, _, waiting, command = model.resolveSequence(promptBindingsMode, key.String())
+		if waiting {
+			return model, command
+		}
+		if action == actionPromptQuit {
+			return model, tea.Quit
+		}
+		if model.terminalTooSmall() {
+			return model, nil
+		}
+		if model.mode == startingNumberMode {
+			return model.updateStartingNumber(key, action), nil
+		}
+		return model.updateResumeNumber(key, action), nil
+	}
+	if model.mode == inlineAnswerMode {
+		if model.terminalTooSmall() {
+			return model, nil
+		}
+		updated, command := model.handleInlineStep(key)
+		return updated, command
+	}
+	updated, command := model.handleNormalStep(key.String())
+	return updated, command
+}
+
+func (model worksheetModel) handleNormalStep(step string) (worksheetModel, tea.Cmd) {
+	if model.resetArmed {
+		candidate := append(append([]string(nil), model.pendingKeys...), step)
+		if !model.keymap.mightMatchAction(actionReset, candidate) {
 			model.resetArmed = false
 			model.resetToken++
 			model.resetBy = time.Time{}
 			model.status = "Reset disarmed; Worksheet unchanged"
 		}
-		if model.terminalTooSmall() {
-			if hasAction && action == actionQuit {
-				return model, tea.Quit
-			}
-			return model, nil
-		}
-		if model.mode == inlineAnswerMode {
-			return model.updateInlineAnswer(key), nil
-		}
+	}
+	model, action, hasAction, waiting, command := model.resolveSequence(normalMode, step)
+	if waiting {
+		return model, command
+	}
+	if model.terminalTooSmall() {
 		if hasAction && action == actionQuit {
 			return model, tea.Quit
 		}
-		if model.helpOpen {
-			if hasAction && action == actionHelp {
-				model.helpOpen = false
-			}
-			return model, nil
+		return model, nil
+	}
+	if !hasAction {
+		return model, nil
+	}
+	if action == actionQuit {
+		return model, tea.Quit
+	}
+	if model.helpOpen {
+		if action == actionHelp {
+			model.helpOpen = false
 		}
-		if model.mode == startingNumberMode {
-			return model.updateStartingNumber(key), nil
-		}
-		if model.mode == resumeNumberMode {
-			return model.updateResumeNumber(key), nil
-		}
-		if hasAction && action == actionHelp {
-			model.helpOpen = true
-			return model, nil
-		}
-		if hasAction && action == actionReset {
-			now := time.Now()
-			if model.resetArmed && now.Before(model.resetBy) {
-				model.resetArmed = false
-				model.resetToken++
-				model.resetBy = time.Time{}
-				if err := resetWorksheetState(); err != nil {
-					model.status = fmt.Sprintf("Could not reset Worksheet; state preserved where possible: %v", err)
-					return model, nil
-				}
-				model.worksheet = worksheet{}
-				model.mode = startingNumberMode
-				model.startInput = ""
-				model.editInput = ""
-				model.status = "Worksheet reset after archive; enter a positive starting number"
-				return model, nil
-			}
-			model.resetArmed = true
+		return model, nil
+	}
+	if action == actionHelp {
+		model.helpOpen = true
+		return model, nil
+	}
+	if action == actionReset {
+		now := time.Now()
+		if model.resetArmed && now.Before(model.resetBy) {
+			model.resetArmed = false
 			model.resetToken++
-			model.resetBy = now.Add(resetConfirmationWindow)
-			token := model.resetToken
-			model.status = fmt.Sprintf("Reset armed — press %s again within 2 seconds to archive and reset this Worksheet", model.keymap.labels(actionReset))
-			return model, tea.Tick(resetConfirmationWindow, func(time.Time) tea.Msg {
-				return resetExpiredMsg{token: token}
-			})
-		}
-		if !hasAction {
-			return model, nil
-		}
-		switch action {
-		case actionClear:
-			selected := model.worksheet.Selected
-			if model.worksheet.answer(selected) == "" {
-				model.status = fmt.Sprintf("Answer Slot %d is already empty", selected)
+			model.resetBy = time.Time{}
+			if err := resetWorksheetState(); err != nil {
+				model.status = fmt.Sprintf("Could not reset Worksheet; state preserved where possible: %v", err)
 				return model, nil
 			}
-			candidate := model.worksheet.withClearedAnswer()
-			status := fmt.Sprintf("Answer Slot %d cleared", selected)
-			return model.persistWorksheet(candidate, status, revealSelectedSlot), nil
-		case actionUndo:
-			if model.worksheet.Undo == nil {
-				model.status = "Nothing to undo"
-				return model, nil
-			}
-			candidate, number := model.worksheet.withUndo()
-			status := fmt.Sprintf("Undid Answer Slot %d", number)
-			return model.persistWorksheet(candidate, status, revealSelectedSlot), nil
-		case actionCopy:
-			return model, copyAnswerList(model.worksheet)
-		case actionInline:
-			model.mode = inlineAnswerMode
-			model.editInput = model.worksheet.answer(model.worksheet.Selected)
-			model.status = "Editing Custom Answer inline"
+			model.worksheet = worksheet{}
+			model.mode = startingNumberMode
+			model.startInput = ""
+			model.editInput = ""
+			model.status = "Worksheet reset after archive; enter a positive starting number"
 			return model, nil
-		case actionExternal:
-			return model.openExternalEditor()
-		case actionMoveDown, actionSkip:
-			return model.moveSelection(1), nil
-		case actionMoveUp:
-			return model.moveSelection(-1), nil
 		}
-		if answer, ok := model.keymap.answerFor(action); ok {
-			status := "Preset Answer committed"
-			if action == actionExplain {
-				status = "Answer committed"
-			}
-			return model.commitAnswer(answer, status), nil
+		model.resetArmed = true
+		model.resetToken++
+		model.resetBy = now.Add(resetConfirmationWindow)
+		token := model.resetToken
+		model.status = fmt.Sprintf("Reset armed — press %s again within 2 seconds to archive and reset this Worksheet", model.keymap.labels(actionReset))
+		return model, tea.Tick(resetConfirmationWindow, func(time.Time) tea.Msg {
+			return resetExpiredMsg{token: token}
+		})
+	}
+	switch action {
+	case actionClear:
+		selected := model.worksheet.Selected
+		if model.worksheet.answer(selected) == "" {
+			model.status = fmt.Sprintf("Answer Slot %d is already empty", selected)
+			return model, nil
 		}
+		candidate := model.worksheet.withClearedAnswer()
+		status := fmt.Sprintf("Answer Slot %d cleared", selected)
+		return model.persistWorksheet(candidate, status, revealSelectedSlot), nil
+	case actionUndo:
+		if model.worksheet.Undo == nil {
+			model.status = "Nothing to undo"
+			return model, nil
+		}
+		candidate, number := model.worksheet.withUndo()
+		status := fmt.Sprintf("Undid Answer Slot %d", number)
+		return model.persistWorksheet(candidate, status, revealSelectedSlot), nil
+	case actionCopy:
+		return model, copyAnswerList(model.worksheet)
+	case actionInline:
+		model.mode = inlineAnswerMode
+		model.editInput = model.worksheet.answer(model.worksheet.Selected)
+		model.status = "Editing Custom Answer inline"
+		return model, nil
+	case actionExternal:
+		return model.openExternalEditor()
+	case actionMoveDown, actionSkip:
+		return model.moveSelection(1), nil
+	case actionMoveUp:
+		return model.moveSelection(-1), nil
+	case actionJumpFirst:
+		if model.worksheet.Selected == model.worksheet.FirstNumber {
+			return model, nil
+		}
+		candidate := model.worksheet
+		candidate.Selected = candidate.FirstNumber
+		return model.persistWorksheet(candidate, "Selection moved", revealSelectedSlot), nil
+	}
+	if answer, ok := model.keymap.answerFor(action); ok {
+		status := "Preset Answer committed"
+		if action == actionExplain {
+			status = "Answer committed"
+		}
+		return model.commitAnswer(answer, status), nil
 	}
 	return model, nil
 }
 
-func (model worksheetModel) updateInlineAnswer(key tea.KeyMsg) worksheetModel {
-	switch key.String() {
-	case "enter":
-		model.mode = normalMode
-		return model.commitAnswer(model.editInput, "Custom Answer committed")
-	case "esc":
-		model.mode = normalMode
-		model.editInput = ""
-		model.status = "Inline Custom Answer cancelled"
-		return model.ensureSelectionVisible(model.mode, model.status)
-	case "backspace":
-		runes := []rune(model.editInput)
-		if len(runes) > 0 {
-			model.editInput = string(runes[:len(runes)-1])
+func (model worksheetModel) handleInlineStep(key tea.KeyMsg) (worksheetModel, tea.Cmd) {
+	var action keyAction
+	var hasAction, waiting bool
+	var command tea.Cmd
+	model, action, hasAction, waiting, command = model.resolveSequence(inlineAnswerMode, key.String())
+	if waiting {
+		return model, command
+	}
+	return model.updateInlineAnswer(key, action, hasAction), nil
+}
+
+func (model worksheetModel) resolveSequence(mode interactionMode, step string) (worksheetModel, keyAction, bool, bool, tea.Cmd) {
+	if len(model.pendingKeys) != 0 && !time.Now().Before(model.sequenceBy) {
+		model.clearSequence()
+		model.status = "Sequence expired"
+	}
+	sequence := append(append([]string(nil), model.pendingKeys...), step)
+	action, hasAction := model.keymap.actionFor(mode, sequence)
+	if !hasAction && model.keymap.hasPrefix(mode, sequence) {
+		model.pendingKeys = sequence
+		model.sequenceToken++
+		model.sequenceBy = time.Now().Add(model.keymap.sequenceTimeout)
+		token := model.sequenceToken
+		return model, "", false, true, tea.Tick(model.keymap.sequenceTimeout, func(time.Time) tea.Msg { return sequenceExpiredMsg{token: token} })
+	}
+	if len(model.pendingKeys) != 0 {
+		model.clearSequence()
+		if !hasAction {
+			model.status = "Sequence cancelled"
+			return model.resolveSequence(mode, step)
 		}
-		return model
+	}
+	return model, action, hasAction, false, nil
+}
+
+func (model *worksheetModel) clearSequence() {
+	model.pendingKeys = nil
+	model.sequenceToken++
+	model.sequenceBy = time.Time{}
+}
+
+func (model worksheetModel) updateInlineAnswer(key tea.KeyMsg, action keyAction, hasAction bool) worksheetModel {
+	if hasAction {
+		switch action {
+		case actionFinish:
+			model.mode = normalMode
+			return model.commitAnswer(model.editInput, "Custom Answer committed")
+		case actionCancel:
+			model.mode = normalMode
+			model.editInput = ""
+			model.status = "Inline Custom Answer cancelled"
+			return model.ensureSelectionVisible(model.mode, model.status)
+		case actionBackspace:
+			runes := []rune(model.editInput)
+			if len(runes) > 0 {
+				model.editInput = string(runes[:len(runes)-1])
+			}
+			return model
+		}
 	}
 	for _, typed := range key.Runes {
 		if typed != '\n' && typed != '\r' {
@@ -250,9 +359,9 @@ func (model worksheetModel) updateInlineAnswer(key tea.KeyMsg) worksheetModel {
 	return model
 }
 
-func (model worksheetModel) updateStartingNumber(key tea.KeyMsg) worksheetModel {
-	switch key.String() {
-	case "enter":
+func (model worksheetModel) updateStartingNumber(key tea.KeyMsg, action keyAction) worksheetModel {
+	switch action {
+	case actionPromptSubmit:
 		start, err := parseStartingNumber(model.startInput)
 		if err != nil {
 			model.startInput = ""
@@ -274,11 +383,11 @@ func (model worksheetModel) updateStartingNumber(key tea.KeyMsg) worksheetModel 
 		model.status = "Worksheet created"
 		return model
 	}
-	return model.updateNumberInput(key)
+	return model.updateNumberInput(key, action)
 }
 
-func (model worksheetModel) updateNumberInput(key tea.KeyMsg) worksheetModel {
-	if key.String() == "backspace" {
+func (model worksheetModel) updateNumberInput(key tea.KeyMsg, action keyAction) worksheetModel {
+	if action == actionPromptErase {
 		if len(model.startInput) > 0 {
 			model.startInput = model.startInput[:len(model.startInput)-1]
 		}
@@ -299,9 +408,9 @@ func (model worksheetModel) updateNumberInput(key tea.KeyMsg) worksheetModel {
 	return model
 }
 
-func (model worksheetModel) updateResumeNumber(key tea.KeyMsg) worksheetModel {
-	switch key.String() {
-	case "enter":
+func (model worksheetModel) updateResumeNumber(key tea.KeyMsg, action keyAction) worksheetModel {
+	switch action {
+	case actionPromptSubmit:
 		start := model.worksheet.defaultResumeNumber()
 		var err error
 		if model.startInput != "" {
@@ -317,7 +426,7 @@ func (model worksheetModel) updateResumeNumber(key tea.KeyMsg) worksheetModel {
 		model.startInput = ""
 		return model.persistWorksheet(candidate, "Worksheet resumed", revealSelectedSlot)
 	}
-	return model.updateNumberInput(key)
+	return model.updateNumberInput(key, action)
 }
 
 func (model worksheetModel) openExternalEditor() (worksheetModel, tea.Cmd) {
@@ -469,19 +578,19 @@ func (model worksheetModel) promptView() string {
 			last = strconv.Itoa(lastAnswered)
 		}
 		fmt.Fprintf(&view, "Last answered: %s. Start at [%d]: %s\n", last, model.worksheet.defaultResumeNumber(), model.startInput)
-		if model.status != "" {
-			fmt.Fprintf(&view, "\n%s\n", runewidth.Wrap("Status: "+model.status, model.size.width))
+		if status := model.statusText(); status != "" {
+			fmt.Fprintf(&view, "\n%s\n", runewidth.Wrap("Status: "+status, model.size.width))
 		}
-		fmt.Fprintf(&view, "\nHelp: Enter resume • %s quit\n", model.keymap.labels(actionQuit))
+		fmt.Fprintf(&view, "\nHelp: %s resume • %s quit\n", model.keymap.labels(actionPromptSubmit), model.keymap.labels(actionPromptQuit))
 		return strings.TrimSuffix(view.String(), "\n")
 	}
 	view.WriteString(model.styled(headingStyle, "Grill TUI — Create a Worksheet") + "\n\n")
 	view.WriteString("Enter a positive starting number.\n")
 	fmt.Fprintf(&view, "Starting number: %s\n", model.startInput)
-	if model.status != "" {
-		fmt.Fprintf(&view, "\n%s\n", runewidth.Wrap("Status: "+model.status, model.size.width))
+	if status := model.statusText(); status != "" {
+		fmt.Fprintf(&view, "\n%s\n", runewidth.Wrap("Status: "+status, model.size.width))
 	}
-	fmt.Fprintf(&view, "\nHelp: Enter create • %s quit\n", model.keymap.labels(actionQuit))
+	fmt.Fprintf(&view, "\nHelp: %s create • %s quit\n", model.keymap.labels(actionPromptSubmit), model.keymap.labels(actionPromptQuit))
 	return strings.TrimSuffix(view.String(), "\n")
 }
 
@@ -518,10 +627,13 @@ func (model worksheetModel) worksheetView() string {
 		prefix := fmt.Sprintf("Inline Custom Answer %d: ", selected)
 		inputWidth := max(1, model.size.width-runewidth.StringWidth(prefix))
 		fmt.Fprintf(&view, "\n%s%s\n", prefix, runewidth.Truncate(singleLineAnswer(model.editInput), inputWidth, "…"))
-		view.WriteString("Help: Enter commit • Esc cancel\n")
+		if len(model.pendingKeys) != 0 || model.status == "Sequence expired" || model.status == "Sequence cancelled" {
+			fmt.Fprintf(&view, "Status: %s\n", model.statusText())
+		}
+		fmt.Fprintf(&view, "Help: %s commit • %s cancel\n", model.keymap.labels(actionFinish), model.keymap.labels(actionCancel))
 		return strings.TrimSuffix(view.String(), "\n")
 	}
-	status := displayedStatus(model.status)
+	status := displayedStatus(model.statusText())
 	fmt.Fprintf(&view, "\n%s\n", model.styled(statusStyle, runewidth.Wrap("Status: "+status, model.size.width)))
 	view.WriteString(runewidth.Wrap(model.keymap.compactHelp(), model.size.width) + "\n")
 	return strings.TrimSuffix(view.String(), "\n")
@@ -529,6 +641,9 @@ func (model worksheetModel) worksheetView() string {
 
 func (model worksheetModel) helpView() string {
 	help := model.keymap.completeHelp()
+	if len(model.pendingKeys) != 0 || model.status == "Sequence expired" || model.status == "Sequence cancelled" {
+		help += "\nStatus: " + model.statusText() + "\n"
+	}
 	help = runewidth.Wrap(strings.TrimSuffix(help, "\n"), model.size.width)
 	return strings.Replace(help, "Grill TUI — Complete Help", model.styled(headingStyle, "Grill TUI — Complete Help"), 1)
 }
@@ -545,6 +660,9 @@ func (model worksheetModel) visibleAnswerSlotsFor(storedWorksheet worksheet, mod
 	previewRows := wrappedLineCount(selectedPreview(storedWorksheet), model.size.width)
 	overhead := inlineFixedRows + previewRows
 	if mode != inlineAnswerMode {
+		if len(model.pendingKeys) != 0 {
+			status = model.statusText()
+		}
 		statusRows := wrappedLineCount("Status: "+displayedStatus(status), model.size.width)
 		helpRows := wrappedLineCount(model.keymap.compactHelp(), model.size.width)
 		overhead = worksheetFixedRows + previewRows + statusRows + helpRows
@@ -604,6 +722,13 @@ func displayedStatus(status string) string {
 		return "Worksheet ready"
 	}
 	return status
+}
+
+func (model worksheetModel) statusText() string {
+	if len(model.pendingKeys) != 0 {
+		return "Pending input: " + strings.Join(model.pendingKeys, "")
+	}
+	return model.status
 }
 
 func wrappedLineCount(text string, width int) int {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -13,6 +14,7 @@ type keyAction string
 const (
 	actionMoveDown     keyAction = "move_down"
 	actionMoveUp       keyAction = "move_up"
+	actionJumpFirst    keyAction = "jump_first"
 	actionSkip         keyAction = "skip"
 	actionRecommended  keyAction = "recommended"
 	actionYes          keyAction = "yes"
@@ -41,11 +43,19 @@ const (
 	actionReset        keyAction = "reset"
 	actionHelp         keyAction = "help"
 	actionQuit         keyAction = "quit"
+	actionFinish       keyAction = "finish"
+	actionCancel       keyAction = "cancel"
+	actionBackspace    keyAction = "backspace"
+	actionPromptSubmit keyAction = "submit"
+	actionPromptErase  keyAction = "erase"
+	actionPromptQuit   keyAction = "prompt_quit"
 )
 
 type actionDefinition struct {
 	action          keyAction
 	defaultBindings []string
+	mode            interactionMode
+	configName      string
 	answer          string
 	choice          bool
 	required        bool
@@ -54,6 +64,7 @@ type actionDefinition struct {
 var actionDefinitions = []actionDefinition{
 	{action: actionMoveDown, defaultBindings: []string{"down", "j", "ctrl+n"}},
 	{action: actionMoveUp, defaultBindings: []string{"up", "k", "ctrl+p"}},
+	{action: actionJumpFirst, defaultBindings: []string{"gg"}},
 	{action: actionSkip, defaultBindings: []string{"space"}},
 	{action: actionRecommended, defaultBindings: []string{"r", "R"}, answer: "recommended"},
 	{action: actionYes, defaultBindings: []string{"y", "Y"}, answer: "yes"},
@@ -82,44 +93,80 @@ var actionDefinitions = []actionDefinition{
 	{action: actionReset, defaultBindings: []string{"ctrl+r"}},
 	{action: actionHelp, defaultBindings: []string{"?"}},
 	{action: actionQuit, defaultBindings: []string{"q", "ctrl+q", "ctrl+c"}, required: true},
+	{action: actionFinish, mode: inlineAnswerMode, defaultBindings: []string{"enter"}, required: true},
+	{action: actionCancel, mode: inlineAnswerMode, defaultBindings: []string{"esc"}},
+	{action: actionBackspace, mode: inlineAnswerMode, defaultBindings: []string{"backspace"}},
+	{action: actionPromptSubmit, mode: promptBindingsMode, defaultBindings: []string{"enter"}, required: true},
+	{action: actionPromptErase, mode: promptBindingsMode, defaultBindings: []string{"backspace"}},
+	{action: actionPromptQuit, mode: promptBindingsMode, configName: "quit", defaultBindings: []string{"q", "ctrl+q", "ctrl+c"}, required: true},
+}
+
+func (definition actionDefinition) name() string {
+	if definition.configName != "" {
+		return definition.configName
+	}
+	return string(definition.action)
 }
 
 type keymap struct {
-	bindings map[keyAction][]keyBinding
-	actions  map[string]keyAction
+	bindings        map[keyAction][]keyBinding
+	actions         map[interactionMode]map[string]keyAction
+	prefixes        map[interactionMode]map[string]bool
+	sequenceTimeout time.Duration
 }
 
 type keyBinding struct {
-	name string
+	name  string
+	steps []string
 }
 
 func defaultKeymap() keymap {
-	configured, err := buildKeymap(defaultBindings())
+	configured, err := buildKeymap(defaultBindings(), 1000)
 	if err != nil {
 		panic(fmt.Sprintf("invalid built-in Keymap: %v", err))
 	}
 	return configured
 }
 
-func buildKeymap(bindings map[keyAction][]string) (keymap, error) {
-	configured := keymap{
-		bindings: make(map[keyAction][]keyBinding, len(actionDefinitions)),
-		actions:  make(map[string]keyAction),
+func buildKeymap(bindings map[keyAction][]string, timeoutMS int) (keymap, error) {
+	if timeoutMS < 100 || timeoutMS > 5000 {
+		return keymap{}, fmt.Errorf("input.sequence_timeout_ms must be within 100–5000 milliseconds, got %d", timeoutMS)
 	}
+	configured := keymap{
+		bindings:        make(map[keyAction][]keyBinding, len(actionDefinitions)),
+		actions:         map[interactionMode]map[string]keyAction{normalMode: {}, inlineAnswerMode: {}, promptBindingsMode: {}},
+		prefixes:        map[interactionMode]map[string]bool{normalMode: {}, inlineAnswerMode: {}, promptBindingsMode: {}},
+		sequenceTimeout: time.Duration(timeoutMS) * time.Millisecond,
+	}
+	type assignedBinding struct {
+		actionName string
+		name       string
+		steps      []string
+	}
+	assigned := map[interactionMode][]assignedBinding{}
 	for _, definition := range actionDefinitions {
 		keys := bindings[definition.action]
 		if definition.required && len(keys) == 0 {
-			return keymap{}, fmt.Errorf("keymap.%s must contain at least one key binding", definition.action)
+			return keymap{}, fmt.Errorf("keymap.%s must contain at least one key binding", definition.name())
 		}
 		for _, configuredKey := range keys {
 			binding, err := parseKeyBinding(configuredKey)
 			if err != nil {
-				return keymap{}, fmt.Errorf("keymap.%s: %w", definition.action, err)
+				return keymap{}, fmt.Errorf("keymap.%s: %w", definition.name(), err)
 			}
-			if previous, exists := configured.actions[binding.name]; exists {
-				return keymap{}, fmt.Errorf("keymap binding %q conflicts between %s and %s", configuredKey, previous, definition.action)
+			for _, previous := range assigned[definition.mode] {
+				if sequenceID(previous.steps) == sequenceID(binding.steps) {
+					return keymap{}, fmt.Errorf("keymap binding %q conflicts between %s and %s (bindings %q and %q)", binding.name, previous.actionName, definition.name(), previous.name, binding.name)
+				}
+				if isSequencePrefix(previous.steps, binding.steps) || isSequencePrefix(binding.steps, previous.steps) {
+					return keymap{}, fmt.Errorf("keymap binding %q for %s conflicts with binding %q for %s in the same mode", binding.name, definition.name(), previous.name, previous.actionName)
+				}
 			}
-			configured.actions[binding.name] = definition.action
+			assigned[definition.mode] = append(assigned[definition.mode], assignedBinding{actionName: definition.name(), name: binding.name, steps: binding.steps})
+			configured.actions[definition.mode][sequenceID(binding.steps)] = definition.action
+			for length := 1; length < len(binding.steps); length++ {
+				configured.prefixes[definition.mode][sequenceID(binding.steps[:length])] = true
+			}
 			configured.bindings[definition.action] = append(configured.bindings[definition.action], binding)
 		}
 	}
@@ -136,14 +183,55 @@ func buildKeymap(bindings map[keyAction][]string) (keymap, error) {
 	return configured, nil
 }
 
+func isSequencePrefix(prefix, sequence []string) bool {
+	if len(prefix) > len(sequence) {
+		return false
+	}
+	for index, step := range prefix {
+		if sequence[index] != step {
+			return false
+		}
+	}
+	return true
+}
+
+func sequenceID(steps []string) string {
+	return strings.Join(steps, "\x00")
+}
+
 func parseKeyBinding(key string) (keyBinding, error) {
+	if single, err := parseKeyName(key); err == nil {
+		return keyBinding{name: single, steps: []string{single}}, nil
+	}
+	parts := strings.Fields(key)
+	if len(parts) == 1 && utf8.RuneCountInString(key) > 1 && !strings.Contains(key, "+") {
+		parts = make([]string, 0, utf8.RuneCountInString(key))
+		for _, character := range key {
+			parts = append(parts, string(character))
+		}
+	}
+	if len(parts) < 2 {
+		return keyBinding{}, fmt.Errorf("invalid key name %q", key)
+	}
+	steps := make([]string, 0, len(parts))
+	for _, part := range parts {
+		step, err := parseKeyName(part)
+		if err != nil {
+			return keyBinding{}, fmt.Errorf("invalid key sequence %q: %w", key, err)
+		}
+		steps = append(steps, step)
+	}
+	return keyBinding{name: key, steps: steps}, nil
+}
+
+func parseKeyName(key string) (string, error) {
 	aliases := map[string]string{
 		"ctrl+i": "tab",
 		"ctrl+m": "enter",
 		"ctrl+[": "esc",
 	}
 	if canonical, ok := aliases[key]; ok {
-		return keyBinding{name: canonical}, nil
+		return canonical, nil
 	}
 	named := map[string]string{
 		"up": "up", "down": "down", "left": "left", "right": "right",
@@ -152,43 +240,56 @@ func parseKeyBinding(key string) (keyBinding, error) {
 		"home": "home", "end": "end", "pgup": "pgup", "pgdown": "pgdown",
 	}
 	if canonical, ok := named[key]; ok {
-		return keyBinding{name: canonical}, nil
+		return canonical, nil
 	}
 	if strings.HasPrefix(key, "ctrl+") {
 		control := strings.TrimPrefix(key, "ctrl+")
 		if len(control) == 1 && ((control[0] >= 'a' && control[0] <= 'z') || strings.ContainsRune("@[\\]^_", rune(control[0]))) {
-			return keyBinding{name: key}, nil
+			return key, nil
 		}
-		return keyBinding{}, fmt.Errorf("invalid key name %q; use ctrl+a through ctrl+z or a supported control symbol", key)
+		return "", fmt.Errorf("invalid key name %q; use ctrl+a through ctrl+z or a supported control symbol", key)
 	}
 	if strings.HasPrefix(key, "alt+") {
 		modified := strings.TrimPrefix(key, "alt+")
 		if utf8.RuneCountInString(modified) == 1 {
 			r, _ := utf8.DecodeRuneInString(modified)
 			if unicode.IsPrint(r) && !unicode.IsSpace(r) {
-				return keyBinding{name: key}, nil
+				return key, nil
 			}
 		}
-		return keyBinding{}, fmt.Errorf("invalid key name %q; alt bindings require one printable non-space character", key)
+		return "", fmt.Errorf("invalid key name %q; alt bindings require one printable non-space character", key)
 	}
 	if strings.HasPrefix(key, "f") {
 		functionNumber, err := strconv.Atoi(strings.TrimPrefix(key, "f"))
 		if err == nil && functionNumber >= 1 && functionNumber <= 12 {
-			return keyBinding{name: key}, nil
+			return key, nil
 		}
 	}
 	if utf8.RuneCountInString(key) == 1 {
 		r, _ := utf8.DecodeRuneInString(key)
 		if unicode.IsPrint(r) && !unicode.IsSpace(r) {
-			return keyBinding{name: key}, nil
+			return key, nil
 		}
 	}
-	return keyBinding{}, fmt.Errorf("invalid key name %q", key)
+	return "", fmt.Errorf("invalid key name %q", key)
 }
 
-func (configured keymap) actionFor(key string) (keyAction, bool) {
-	action, ok := configured.actions[key]
+func (configured keymap) actionFor(mode interactionMode, steps []string) (keyAction, bool) {
+	action, ok := configured.actions[mode][sequenceID(steps)]
 	return action, ok
+}
+
+func (configured keymap) hasPrefix(mode interactionMode, steps []string) bool {
+	return configured.prefixes[mode][sequenceID(steps)]
+}
+
+func (configured keymap) mightMatchAction(action keyAction, steps []string) bool {
+	for _, binding := range configured.bindings[action] {
+		if isSequencePrefix(steps, binding.steps) {
+			return true
+		}
+	}
+	return false
 }
 
 func (configured keymap) answerFor(action keyAction) (string, bool) {
@@ -216,6 +317,16 @@ func (configured keymap) labelsWithSeparator(action keyAction, separator string)
 }
 
 func (binding keyBinding) display() string {
+	if len(binding.steps) > 1 {
+		if !strings.ContainsAny(binding.name, " \t\n") {
+			return binding.name
+		}
+		labels := make([]string, 0, len(binding.steps))
+		for _, step := range binding.steps {
+			labels = append(labels, (keyBinding{name: step}).display())
+		}
+		return strings.Join(labels, " ")
+	}
 	switch binding.name {
 	case " ":
 		return "Space"
@@ -254,28 +365,30 @@ func (binding keyBinding) display() string {
 
 func (configured keymap) completeHelp() string {
 	return fmt.Sprintf(`Grill TUI — Complete Help
-
 %s
-Skip: %s
+Jump first: %s; Skip: %s
 Presets: %s recommended; %s yes; %s no
 Choices: %s
-Explain: %s
+Explain: %s; Prompt submit: %s
 Custom: %s inline; %s external editor
-Inline edit: Enter commit; Esc cancel
+Inline edit: %s commit; %s cancel
+Erase: %s Insert; %s prompt
 Correct: %s clear; %s undo
 Mouse: left click select; wheel scroll
 Copy: %s
 Reset: %s twice within two seconds
 Help: %s; Quit: %s
-
-Press %s to close; Worksheet remains unchanged.
+Prompt quit: %s
 `,
-		configured.movementHelp(),
-		configured.labels(actionSkip), configured.labels(actionRecommended), configured.labels(actionYes), configured.labels(actionNo),
+		configured.movementHelp(), configured.labels(actionJumpFirst), configured.labels(actionSkip),
+		configured.labels(actionRecommended), configured.labels(actionYes), configured.labels(actionNo),
 		configured.choiceSummary(),
-		configured.labels(actionExplain), configured.labels(actionInline), configured.labels(actionExternal),
+		configured.labels(actionExplain), configured.labels(actionPromptSubmit),
+		configured.labels(actionInline), configured.labels(actionExternal),
+		configured.labels(actionFinish), configured.labels(actionCancel),
+		configured.labels(actionBackspace), configured.labels(actionPromptErase),
 		configured.labels(actionClear), configured.labels(actionUndo), configured.labels(actionCopy), configured.labels(actionReset), configured.labels(actionHelp), configured.labelsWithSeparator(actionQuit, ", "),
-		configured.labels(actionHelp))
+		configured.labels(actionPromptQuit))
 }
 
 func (configured keymap) compactHelp() string {
@@ -298,7 +411,7 @@ func (configured keymap) isDefault() bool {
 		}
 		for index, defaultBinding := range definition.defaultBindings {
 			parsedDefault, err := parseKeyBinding(defaultBinding)
-			if err != nil || configuredKeys[index] != parsedDefault {
+			if err != nil || configuredKeys[index].name != parsedDefault.name {
 				return false
 			}
 		}
