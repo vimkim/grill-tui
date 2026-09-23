@@ -142,7 +142,7 @@ func acquireWorksheetLock() (*worksheetLock, error) {
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = file.Close()
 		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
-			return nil, errors.New("Worksheet is already open in another process; close it before starting a second writer")
+			return nil, fmt.Errorf("Worksheet %q is already open by a live TUI writer in another process; close it before starting a second writer", store.name)
 		}
 		return nil, fmt.Errorf("acquire Worksheet lock: %w", err)
 	}
@@ -201,9 +201,14 @@ func ensureOwnerOnlyDirectory(path string) error {
 }
 
 func openOwnerOnlyFile(path string, flags int, permissions uint32) (*os.File, error) {
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("refuse symbolic link for Worksheet artifact %s", path)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refuse symbolic link for Worksheet artifact %s", path)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("Worksheet artifact %s is not a regular file", path)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	fileDescriptor, err := unix.Open(path, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, permissions)
