@@ -19,7 +19,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 	"github.com/mattn/go-runewidth"
@@ -1196,7 +1198,7 @@ func TestXCommitsExplainFurtherAndAutoAdvances(t *testing.T) {
 	terminal.waitForExit(t)
 }
 
-func TestInlineCustomAnswerIsSeededAndEscapeCancelsWithoutChangingAnswer(t *testing.T) {
+func TestInlineCustomAnswerIsSeededAndEscapeCommitsWithoutAdvancing(t *testing.T) {
 	terminal := startTerminal(t, t.TempDir(), "30")
 	terminal.send(t, "r")
 	terminal.waitForSelection(t, 31)
@@ -1204,19 +1206,19 @@ func TestInlineCustomAnswerIsSeededAndEscapeCancelsWithoutChangingAnswer(t *test
 	terminal.waitForSelection(t, 30)
 
 	terminal.send(t, "i")
-	editing := terminal.waitFor(t, "Inline Custom Answer 30: recommended")
-	if !strings.Contains(editing, "Enter commit • Esc cancel") {
+	editing := terminal.waitFor(t, "Insert Mode — Answer Slot 30\nrecommended")
+	if !strings.Contains(editing, "Enter commit+next • Esc finish") {
 		t.Fatalf("inline editing help is missing:\n%s", editing)
 	}
 	terminal.send(t, " replacement")
 	terminal.waitFor(t, "recommended replacement")
 	terminal.send(t, "\x1b")
-	screen := terminal.waitFor(t, "Inline Custom Answer cancelled")
-	if !strings.Contains(screen, "> 30 │ recommended") {
-		t.Fatalf("cancelling inline editing changed the Answer Slot:\n%s", screen)
+	screen := terminal.waitFor(t, "Custom Answer committed")
+	if !strings.Contains(screen, "> 30 │ recommended replacement") {
+		t.Fatalf("finishing inline editing did not commit the Answer Slot in place:\n%s", screen)
 	}
-	if !strings.Contains(screen, "Selected Answer 30 (full):\nrecommended") {
-		t.Fatalf("cancelling inline editing changed the selected-answer preview:\n%s", screen)
+	if !strings.Contains(screen, "Selected Answer 30 (full):\nrecommended replacement") {
+		t.Fatalf("finishing inline editing did not update the selected-answer preview:\n%s", screen)
 	}
 
 	terminal.send(t, "q")
@@ -2411,5 +2413,214 @@ var answerSlotLinePattern = regexp.MustCompile(`(?m)^[ >] ([0-9]+) │`)
 var selectedAnswerSlotPattern = regexp.MustCompile(`(?m)^> ([0-9]+) │`)
 
 func cleanTerminalOutput(output string) string {
-	return ansiSequence.ReplaceAllString(strings.ReplaceAll(output, "\r", ""), "")
+	if !strings.Contains(output, "\x1b[") {
+		return strings.ReplaceAll(output, "\r", "")
+	}
+	const rows, columns = 200, 240
+	screen := make([][]string, rows)
+	blank := func(cells []string) {
+		for index := range cells {
+			cells[index] = " "
+		}
+	}
+	for row := range screen {
+		screen[row] = make([]string, columns)
+		blank(screen[row])
+	}
+	row, column, savedRow, savedColumn := 0, 0, 0, 0
+	var lastAlternate [][]string
+	clearScreen := func() {
+		for y := range screen {
+			blank(screen[y])
+		}
+		row, column = 0, 0
+	}
+	parameters := func(sequence string) []int {
+		sequence = strings.TrimLeft(sequence, "?><")
+		if sequence == "" {
+			return nil
+		}
+		parts := strings.Split(sequence, ";")
+		values := make([]int, len(parts))
+		for index, part := range parts {
+			values[index], _ = strconv.Atoi(part)
+		}
+		return values
+	}
+	parameter := func(values []int, index, fallback int) int {
+		if index >= len(values) || values[index] == 0 {
+			return fallback
+		}
+		return values[index]
+	}
+	cloneScreen := func() [][]string {
+		cloned := make([][]string, len(screen))
+		for index := range screen {
+			cloned[index] = append([]string(nil), screen[index]...)
+		}
+		return cloned
+	}
+
+	for index := 0; index < len(output); {
+		if output[index] == '\x1b' {
+			if index+1 >= len(output) {
+				break
+			}
+			switch output[index+1] {
+			case '[':
+				end := index + 2
+				for end < len(output) && (output[end] < 0x40 || output[end] > 0x7e) {
+					end++
+				}
+				if end >= len(output) {
+					index = len(output)
+					continue
+				}
+				final := output[end]
+				rawParameters := output[index+2 : end]
+				values := parameters(rawParameters)
+				switch final {
+				case 'H', 'f':
+					row = parameter(values, 0, 1) - 1
+					column = parameter(values, 1, 1) - 1
+				case 'd':
+					row = parameter(values, 0, 1) - 1
+				case 'G':
+					column = parameter(values, 0, 1) - 1
+				case 'A':
+					row -= parameter(values, 0, 1)
+				case 'B':
+					row += parameter(values, 0, 1)
+				case 'C':
+					column += parameter(values, 0, 1)
+				case 'D':
+					column -= parameter(values, 0, 1)
+				case 'E':
+					row += parameter(values, 0, 1)
+					column = 0
+				case 'F':
+					row -= parameter(values, 0, 1)
+					column = 0
+				case 'J':
+					switch parameter(values, 0, 0) {
+					case 0:
+						if row >= 0 && row < rows {
+							blank(screen[row][max(0, column):])
+							for y := row + 1; y < rows; y++ {
+								blank(screen[y])
+							}
+						}
+					case 2:
+						clearScreen()
+					}
+				case 'M':
+					if row >= 0 && row < rows {
+						count := min(parameter(values, 0, 1), rows-row)
+						copy(screen[row:], screen[row+count:])
+						for y := rows - count; y < rows; y++ {
+							screen[y] = make([]string, columns)
+							blank(screen[y])
+						}
+					}
+				case 'L':
+					if row >= 0 && row < rows {
+						count := min(parameter(values, 0, 1), rows-row)
+						copy(screen[row+count:], screen[row:rows-count])
+						for y := row; y < row+count; y++ {
+							screen[y] = make([]string, columns)
+							blank(screen[y])
+						}
+					}
+				case 'K':
+					if row >= 0 && row < rows {
+						mode := parameter(values, 0, 0)
+						if mode == 0 {
+							blank(screen[row][max(0, column):])
+						} else if mode == 2 {
+							blank(screen[row])
+						}
+					}
+				case 's':
+					savedRow, savedColumn = row, column
+				case 'u':
+					if rawParameters == "?" {
+						break
+					}
+					row, column = savedRow, savedColumn
+				case 'X':
+					if row >= 0 && row < rows && column >= 0 && column < columns {
+						count := min(parameter(values, 0, 1), columns-column)
+						blank(screen[row][column : column+count])
+					}
+				case 'h':
+					if strings.Contains(rawParameters, "?1049") {
+						clearScreen()
+					}
+				case 'l':
+					if strings.Contains(rawParameters, "?1049") {
+						lastAlternate = cloneScreen()
+					}
+				}
+				row = max(0, min(row, rows-1))
+				column = max(0, min(column, columns-1))
+				index = end + 1
+				continue
+			case ']':
+				end := index + 2
+				for end < len(output) && output[end] != '\a' && !(output[end] == '\x1b' && end+1 < len(output) && output[end+1] == '\\') {
+					end++
+				}
+				if end < len(output) && output[end] == '\x1b' {
+					end++
+				}
+				index = min(end+1, len(output))
+				continue
+			case '7':
+				savedRow, savedColumn = row, column
+			case '8':
+				row, column = savedRow, savedColumn
+			}
+			index += 2
+			continue
+		}
+		switch output[index] {
+		case '\r':
+			column = 0
+			index++
+			continue
+		case '\n':
+			row = min(row+1, rows-1)
+			index++
+			continue
+		case '\b':
+			column = max(0, column-1)
+			index++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(output[index:])
+		if r == utf8.RuneError && size == 0 {
+			break
+		}
+		if !unicode.IsControl(r) && row >= 0 && row < rows && column >= 0 && column < columns {
+			width := max(0, runewidth.RuneWidth(r))
+			if width == 0 && column > 0 {
+				screen[row][column-1] += string(r)
+			} else {
+				screen[row][column] = string(r)
+				for offset := 1; offset < width && column+offset < columns; offset++ {
+					screen[row][column+offset] = "\x00"
+				}
+				column = min(columns-1, column+max(1, width))
+			}
+		}
+		index += size
+	}
+	if lastAlternate != nil {
+		screen = lastAlternate
+	}
+	lines := make([]string, len(screen))
+	for index, cells := range screen {
+		lines[index] = strings.TrimRight(strings.ReplaceAll(strings.Join(cells, ""), "\x00", ""), " ")
+	}
+	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
 }

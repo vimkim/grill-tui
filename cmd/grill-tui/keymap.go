@@ -12,46 +12,47 @@ import (
 type keyAction string
 
 const (
-	actionMoveDown     keyAction = "move_down"
-	actionMoveUp       keyAction = "move_up"
-	actionRebaseDown   keyAction = "rebase_down"
-	actionRebaseUp     keyAction = "rebase_up"
-	actionJumpFirst    keyAction = "jump_first"
-	actionJumpLast     keyAction = "jump_last"
-	actionClearAndNext keyAction = "clear_and_next"
-	actionInsertAbove  keyAction = "insert_above"
-	actionInsertBelow  keyAction = "insert_below"
-	actionDeleteSlot   keyAction = "delete_slot"
-	actionRecommended  keyAction = "recommended"
-	actionYes          keyAction = "yes"
-	actionNo           keyAction = "no"
-	actionChoice1      keyAction = "choice_1"
-	actionChoice2      keyAction = "choice_2"
-	actionChoice3      keyAction = "choice_3"
-	actionChoice4      keyAction = "choice_4"
-	actionChoice5      keyAction = "choice_5"
-	actionChoiceA      keyAction = "choice_a"
-	actionChoiceB      keyAction = "choice_b"
-	actionChoiceC      keyAction = "choice_c"
-	actionChoiceD      keyAction = "choice_d"
-	actionChoiceE      keyAction = "choice_e"
-	actionChoiceUpperA keyAction = "choice_upper_a"
-	actionChoiceUpperB keyAction = "choice_upper_b"
-	actionExplain      keyAction = "explain"
-	actionInline       keyAction = "inline"
-	actionExternal     keyAction = "external"
-	actionClear        keyAction = "clear"
-	actionUndo         keyAction = "undo"
-	actionCopy         keyAction = "copy"
-	actionReset        keyAction = "reset"
-	actionHelp         keyAction = "help"
-	actionQuit         keyAction = "quit"
-	actionFinish       keyAction = "finish"
-	actionCancel       keyAction = "cancel"
-	actionBackspace    keyAction = "backspace"
-	actionPromptSubmit keyAction = "submit"
-	actionPromptErase  keyAction = "erase"
-	actionPromptQuit   keyAction = "prompt_quit"
+	actionMoveDown      keyAction = "move_down"
+	actionMoveUp        keyAction = "move_up"
+	actionRebaseDown    keyAction = "rebase_down"
+	actionRebaseUp      keyAction = "rebase_up"
+	actionJumpFirst     keyAction = "jump_first"
+	actionJumpLast      keyAction = "jump_last"
+	actionClearAndNext  keyAction = "clear_and_next"
+	actionInsertAbove   keyAction = "insert_above"
+	actionInsertBelow   keyAction = "insert_below"
+	actionDeleteSlot    keyAction = "delete_slot"
+	actionRecommended   keyAction = "recommended"
+	actionYes           keyAction = "yes"
+	actionNo            keyAction = "no"
+	actionChoice1       keyAction = "choice_1"
+	actionChoice2       keyAction = "choice_2"
+	actionChoice3       keyAction = "choice_3"
+	actionChoice4       keyAction = "choice_4"
+	actionChoice5       keyAction = "choice_5"
+	actionChoiceA       keyAction = "choice_a"
+	actionChoiceB       keyAction = "choice_b"
+	actionChoiceC       keyAction = "choice_c"
+	actionChoiceD       keyAction = "choice_d"
+	actionChoiceE       keyAction = "choice_e"
+	actionChoiceUpperA  keyAction = "choice_upper_a"
+	actionChoiceUpperB  keyAction = "choice_upper_b"
+	actionExplain       keyAction = "explain"
+	actionInline        keyAction = "inline"
+	actionExternal      keyAction = "external"
+	actionClear         keyAction = "clear"
+	actionUndo          keyAction = "undo"
+	actionCopy          keyAction = "copy"
+	actionReset         keyAction = "reset"
+	actionHelp          keyAction = "help"
+	actionQuit          keyAction = "quit"
+	actionCommitNext    keyAction = "commit"
+	actionFinish        keyAction = "finish"
+	actionInsertNewline keyAction = "newline"
+	actionBackspace     keyAction = "backspace"
+	actionPromptSubmit  keyAction = "submit"
+	actionPromptErase   keyAction = "erase"
+	actionPromptQuit    keyAction = "prompt_quit"
 )
 
 type actionDefinition struct {
@@ -99,8 +100,9 @@ var actionDefinitions = []actionDefinition{
 	{action: actionReset, defaultBindings: []string{"ctrl+r"}},
 	{action: actionHelp, defaultBindings: []string{"?"}},
 	{action: actionQuit, defaultBindings: []string{"q", "ctrl+q", "ctrl+c"}, required: true},
-	{action: actionFinish, mode: inlineAnswerMode, defaultBindings: []string{"enter"}, required: true},
-	{action: actionCancel, mode: inlineAnswerMode, defaultBindings: []string{"esc"}},
+	{action: actionCommitNext, mode: inlineAnswerMode, defaultBindings: []string{"enter"}, required: true},
+	{action: actionFinish, mode: inlineAnswerMode, defaultBindings: []string{"esc"}, required: true},
+	{action: actionInsertNewline, mode: inlineAnswerMode, defaultBindings: []string{"ctrl+enter", "ctrl+j", "alt+enter"}},
 	{action: actionBackspace, mode: inlineAnswerMode, defaultBindings: []string{"backspace"}},
 	{action: actionPromptSubmit, mode: promptBindingsMode, defaultBindings: []string{"enter"}, required: true},
 	{action: actionPromptErase, mode: promptBindingsMode, defaultBindings: []string{"backspace"}},
@@ -250,6 +252,9 @@ func parseKeyName(key string) (string, error) {
 	}
 	if strings.HasPrefix(key, "ctrl+") {
 		control := strings.TrimPrefix(key, "ctrl+")
+		if control == "enter" {
+			return key, nil
+		}
 		if len(control) == 1 && ((control[0] >= 'a' && control[0] <= 'z') || strings.ContainsRune("@[\\]^_", rune(control[0]))) {
 			return key, nil
 		}
@@ -257,6 +262,9 @@ func parseKeyName(key string) (string, error) {
 	}
 	if strings.HasPrefix(key, "alt+") {
 		modified := strings.TrimPrefix(key, "alt+")
+		if modified == "enter" {
+			return key, nil
+		}
 		if utf8.RuneCountInString(modified) == 1 {
 			r, _ := utf8.DecodeRuneInString(modified)
 			if unicode.IsPrint(r) && !unicode.IsSpace(r) {
@@ -378,7 +386,7 @@ Choices: %s
 Explain: %s; Prompt submit: %s
 Custom: %s inline; %s external editor
 Slots: %s/%s insert; %s delete
-Inline edit: %s commit; %s cancel
+Insert Mode: %s commit+next; %s finish; %s hard newline
 Erase: %s Insert; %s prompt
 Correct: %s clear; %s undo
 Mouse: click/wheel; Copy: %s
@@ -392,7 +400,7 @@ Prompt quit: %s
 		configured.labels(actionExplain), configured.labels(actionPromptSubmit),
 		configured.labels(actionInline), configured.labels(actionExternal),
 		configured.labels(actionInsertAbove), configured.labels(actionInsertBelow), configured.labels(actionDeleteSlot),
-		configured.labels(actionFinish), configured.labels(actionCancel),
+		configured.labels(actionCommitNext), configured.labels(actionFinish), configured.labels(actionInsertNewline),
 		configured.labels(actionBackspace), configured.labels(actionPromptErase),
 		configured.labels(actionClear), configured.labels(actionUndo), configured.labels(actionCopy), configured.labels(actionReset), configured.labels(actionHelp), configured.labelsWithSeparator(actionQuit, ", "),
 		configured.labels(actionPromptQuit))

@@ -9,7 +9,8 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -58,7 +59,7 @@ type worksheetModel struct {
 	worksheet     worksheet
 	mode          interactionMode
 	startInput    string
-	editInput     string
+	editor        textarea.Model
 	status        string
 	size          terminalSize
 	helpOpen      bool
@@ -129,20 +130,31 @@ func (model worksheetModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return model, nil
 	}
-	if mouse, ok := message.(tea.MouseMsg); ok {
-		return model.handleMouse(tea.MouseEvent(mouse)), nil
+	if paste, ok := message.(tea.PasteMsg); ok {
+		if model.mode == inlineAnswerMode && !model.terminalTooSmall() {
+			model.editor, _ = model.editor.Update(paste)
+		}
+		return model, nil
 	}
-	if key, ok := message.(tea.KeyMsg); ok {
+	if mouse, ok := message.(tea.MouseMsg); ok {
+		return model.handleMouse(mouse), nil
+	}
+	if key, ok := message.(tea.KeyPressMsg); ok {
 		return model.handleKey(key)
+	}
+	if model.mode == inlineAnswerMode {
+		var command tea.Cmd
+		model.editor, command = model.editor.Update(message)
+		return model, command
 	}
 	return model, nil
 }
 
-func (model worksheetModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if len(key.Runes) > 1 {
+func (model worksheetModel) handleKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if model.mode != inlineAnswerMode && len([]rune(key.Key().Text)) > 1 {
 		var commands []tea.Cmd
-		for _, character := range key.Runes {
-			updated, command := model.handleKey(tea.KeyMsg{Type: key.Type, Runes: []rune{character}})
+		for _, character := range key.Key().Text {
+			updated, command := model.handleKey(tea.KeyPressMsg(tea.Key{Code: character, Text: string(character)}))
 			model = updated.(worksheetModel)
 			if command != nil {
 				commands = append(commands, command)
@@ -154,7 +166,7 @@ func (model worksheetModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var action keyAction
 		var waiting bool
 		var command tea.Cmd
-		model, action, _, waiting, command = model.resolveSequence(promptBindingsMode, key.String())
+		model, action, _, waiting, command = model.resolveSequence(promptBindingsMode, keyStep(key))
 		if waiting {
 			return model, command
 		}
@@ -176,8 +188,15 @@ func (model worksheetModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		updated, command := model.handleInlineStep(key)
 		return updated, command
 	}
-	updated, command := model.handleNormalStep(key.String())
+	updated, command := model.handleNormalStep(keyStep(key))
 	return updated, command
+}
+
+func keyStep(key tea.KeyPressMsg) string {
+	if key.String() == "space" {
+		return " "
+	}
+	return key.String()
 }
 
 func (model worksheetModel) handleNormalStep(step string) (worksheetModel, tea.Cmd) {
@@ -229,7 +248,6 @@ func (model worksheetModel) handleNormalStep(step string) (worksheetModel, tea.C
 			model.worksheet = worksheet{}
 			model.mode = startingNumberMode
 			model.startInput = ""
-			model.editInput = ""
 			model.status = "Worksheet reset after archive; enter a positive starting number"
 			return model, nil
 		}
@@ -264,9 +282,11 @@ func (model worksheetModel) handleNormalStep(step string) (worksheetModel, tea.C
 		return model, copyAnswerList(model.worksheet)
 	case actionInline:
 		model.mode = inlineAnswerMode
-		model.editInput = model.worksheet.answer(model.worksheet.Selected)
-		model.status = "Editing Custom Answer inline"
-		return model, nil
+		model.editor.SetValue(model.worksheet.answer(model.worksheet.Selected))
+		model.editor.MoveToEnd()
+		model.configureEditor()
+		model.status = "Editing Custom Answer in Insert Mode"
+		return model, model.editor.Focus()
 	case actionExternal:
 		return model.openExternalEditor()
 	case actionClearAndNext:
@@ -350,15 +370,35 @@ func (model worksheetModel) handleNormalStep(step string) (worksheetModel, tea.C
 	return model, nil
 }
 
-func (model worksheetModel) handleInlineStep(key tea.KeyMsg) (worksheetModel, tea.Cmd) {
+func (model worksheetModel) handleInlineStep(key tea.KeyPressMsg) (worksheetModel, tea.Cmd) {
 	var action keyAction
 	var hasAction, waiting bool
 	var command tea.Cmd
-	model, action, hasAction, waiting, command = model.resolveSequence(inlineAnswerMode, key.String())
+	model, action, hasAction, waiting, command = model.resolveSequence(inlineAnswerMode, keyStep(key))
 	if waiting {
 		return model, command
 	}
-	return model.updateInlineAnswer(key, action, hasAction), nil
+	if hasAction {
+		switch action {
+		case actionCommitNext:
+			model.editor.Blur()
+			model.mode = normalMode
+			return model.commitAnswer(model.editor.Value(), "Custom Answer committed"), nil
+		case actionFinish:
+			model.editor.Blur()
+			model.mode = normalMode
+			return model.finishAnswer(model.editor.Value(), "Custom Answer committed"), nil
+		case actionInsertNewline:
+			model.editor.InsertString("\n")
+			return model, nil
+		}
+	}
+	if keyStep(key) == " " {
+		model.editor.InsertString(" ")
+		return model, nil
+	}
+	model.editor, command = model.editor.Update(key)
+	return model, command
 }
 
 func (model worksheetModel) resolveSequence(mode interactionMode, step string) (worksheetModel, keyAction, bool, bool, tea.Cmd) {
@@ -391,34 +431,7 @@ func (model *worksheetModel) clearSequence() {
 	model.sequenceBy = time.Time{}
 }
 
-func (model worksheetModel) updateInlineAnswer(key tea.KeyMsg, action keyAction, hasAction bool) worksheetModel {
-	if hasAction {
-		switch action {
-		case actionFinish:
-			model.mode = normalMode
-			return model.commitAnswer(model.editInput, "Custom Answer committed")
-		case actionCancel:
-			model.mode = normalMode
-			model.editInput = ""
-			model.status = "Inline Custom Answer cancelled"
-			return model.ensureSelectionVisible(model.mode, model.status)
-		case actionBackspace:
-			runes := []rune(model.editInput)
-			if len(runes) > 0 {
-				model.editInput = string(runes[:len(runes)-1])
-			}
-			return model
-		}
-	}
-	for _, typed := range key.Runes {
-		if typed != '\n' && typed != '\r' {
-			model.editInput += string(typed)
-		}
-	}
-	return model
-}
-
-func (model worksheetModel) updateStartingNumber(key tea.KeyMsg, action keyAction) worksheetModel {
+func (model worksheetModel) updateStartingNumber(key tea.KeyPressMsg, action keyAction) worksheetModel {
 	switch action {
 	case actionPromptSubmit:
 		start, err := parseStartingNumber(model.startInput)
@@ -445,21 +458,22 @@ func (model worksheetModel) updateStartingNumber(key tea.KeyMsg, action keyActio
 	return model.updateNumberInput(key, action)
 }
 
-func (model worksheetModel) updateNumberInput(key tea.KeyMsg, action keyAction) worksheetModel {
+func (model worksheetModel) updateNumberInput(key tea.KeyPressMsg, action keyAction) worksheetModel {
 	if action == actionPromptErase {
 		if len(model.startInput) > 0 {
 			model.startInput = model.startInput[:len(model.startInput)-1]
 		}
 		return model
 	}
-	if len(key.Runes) > 0 {
-		for _, typed := range key.Runes {
+	text := key.Key().Text
+	if len(text) > 0 {
+		for _, typed := range text {
 			if typed < '0' || typed > '9' {
 				model.status = "Starting number must contain digits only. Try again."
 				return model
 			}
 		}
-		model.startInput += string(key.Runes)
+		model.startInput += text
 		model.status = ""
 		return model
 	}
@@ -467,7 +481,7 @@ func (model worksheetModel) updateNumberInput(key tea.KeyMsg, action keyAction) 
 	return model
 }
 
-func (model worksheetModel) updateResumeNumber(key tea.KeyMsg, action keyAction) worksheetModel {
+func (model worksheetModel) updateResumeNumber(key tea.KeyPressMsg, action keyAction) worksheetModel {
 	switch action {
 	case actionPromptSubmit:
 		start := model.worksheet.defaultResumeNumber()
@@ -532,17 +546,18 @@ func (model worksheetModel) openExternalEditor() (worksheetModel, tea.Cmd) {
 	})
 }
 
-func (model worksheetModel) handleMouse(mouse tea.MouseEvent) worksheetModel {
+func (model worksheetModel) handleMouse(message tea.MouseMsg) worksheetModel {
 	if model.mode != normalMode || model.helpOpen || model.terminalTooSmall() {
 		return model
 	}
+	mouse := message.Mouse()
 	switch mouse.Button {
-	case tea.MouseButtonWheelUp:
+	case tea.MouseWheelUp:
 		return model.scrollViewport(-mouseWheelStep)
-	case tea.MouseButtonWheelDown:
+	case tea.MouseWheelDown:
 		return model.scrollViewport(mouseWheelStep)
-	case tea.MouseButtonLeft:
-		if mouse.Action != tea.MouseActionPress {
+	case tea.MouseLeft:
+		if _, clicked := message.(tea.MouseClickMsg); !clicked {
 			return model
 		}
 		rowOffset := mouse.Y - gridFirstRow
@@ -585,6 +600,11 @@ func (model worksheetModel) commitAnswer(answer, successStatus string) worksheet
 	return model.persistWorksheet(candidate, successStatus, revealSelectedSlot)
 }
 
+func (model worksheetModel) finishAnswer(answer, successStatus string) worksheetModel {
+	candidate := model.worksheet.withFinishedAnswer(answer)
+	return model.persistWorksheet(candidate, successStatus, revealSelectedSlot)
+}
+
 func (model worksheetModel) moveSelection(change int) worksheetModel {
 	candidate, moved := model.worksheet.withSelection(change)
 	if !moved {
@@ -617,14 +637,25 @@ func (model worksheetModel) ensureSelectionVisible(mode interactionMode, status 
 	return model.persistWorksheet(candidate, status, preserveViewport)
 }
 
-func (model worksheetModel) View() string {
+func (model worksheetModel) View() tea.View {
+	var content string
 	if model.terminalTooSmall() {
-		return model.smallTerminalView()
+		content = model.smallTerminalView()
+	} else if model.mode == startingNumberMode || model.mode == resumeNumberMode {
+		content = model.promptView()
+	} else {
+		content = model.worksheetView()
 	}
-	if model.mode == startingNumberMode || model.mode == resumeNumberMode {
-		return model.promptView()
+	view := tea.NewView(content)
+	view.AltScreen = true
+	view.MouseMode = tea.MouseModeCellMotion
+	if model.mode == inlineAnswerMode && !model.terminalTooSmall() {
+		if cursor := model.editor.Cursor(); cursor != nil {
+			cursor.Position.Y += model.editorTopRow()
+			view.Cursor = cursor
+		}
 	}
-	return model.worksheetView()
+	return view
 }
 
 func (model worksheetModel) promptView() string {
@@ -683,19 +714,32 @@ func (model worksheetModel) worksheetView() string {
 	preview := selectedPreview(model.worksheet)
 	fmt.Fprintf(&view, "\nSelected Answer %d (full):\n%s\n", selected, runewidth.Wrap(preview, model.size.width))
 	if model.mode == inlineAnswerMode {
-		prefix := fmt.Sprintf("Inline Custom Answer %d: ", selected)
-		inputWidth := max(1, model.size.width-runewidth.StringWidth(prefix))
-		fmt.Fprintf(&view, "\n%s%s\n", prefix, runewidth.Truncate(singleLineAnswer(model.editInput), inputWidth, "…"))
+		fmt.Fprintf(&view, "\nInsert Mode — Answer Slot %d\n%s\n", selected, model.editor.View())
 		if len(model.pendingKeys) != 0 || model.status == "Sequence expired" || model.status == "Sequence cancelled" {
 			fmt.Fprintf(&view, "Status: %s\n", model.statusText())
 		}
-		fmt.Fprintf(&view, "Help: %s commit • %s cancel\n", model.keymap.labels(actionFinish), model.keymap.labels(actionCancel))
+		fmt.Fprintf(&view, "Help: %s commit+next • %s finish • %s hard newline\n", model.keymap.labels(actionCommitNext), model.keymap.labels(actionFinish), model.keymap.labels(actionInsertNewline))
 		return strings.TrimSuffix(view.String(), "\n")
 	}
 	status := displayedStatus(model.statusText())
 	fmt.Fprintf(&view, "\n%s\n", model.styled(statusStyle, runewidth.Wrap("Status: "+status, model.size.width)))
 	view.WriteString(runewidth.Wrap(model.keymap.compactHelp(), model.size.width) + "\n")
 	return strings.TrimSuffix(view.String(), "\n")
+}
+
+func (model *worksheetModel) configureEditor() {
+	model.editor.SetWidth(model.size.width)
+	model.editor.SetHeight(6)
+}
+
+func (model worksheetModel) editorTopRow() int {
+	content := model.worksheetView()
+	marker := fmt.Sprintf("Insert Mode — Answer Slot %d\n", model.worksheet.Selected)
+	prefix, _, found := strings.Cut(content, marker)
+	if !found {
+		return 0
+	}
+	return strings.Count(prefix, "\n") + 1
 }
 
 func (model worksheetModel) helpView() string {

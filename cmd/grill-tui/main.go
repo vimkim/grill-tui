@@ -10,7 +10,8 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
 )
 
 type worksheetName string
@@ -54,7 +55,12 @@ func run(args []string) error {
 		size:     defaultTerminalSize,
 		useColor: useColor,
 		keymap:   effectiveKeymap,
+		editor:   textarea.New(),
 	}
+	initialModel.editor.ShowLineNumbers = false
+	initialModel.editor.Prompt = ""
+	initialModel.editor.SetVirtualCursor(os.Getenv("TERM") == "dumb")
+	initialModel.configureEditor()
 	existing, recoveryStatus, err := loadWorksheet()
 	if err == nil {
 		initialModel.worksheet = existing
@@ -90,7 +96,7 @@ func run(args []string) error {
 		}
 	}
 
-	program := tea.NewProgram(initialModel, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	program := tea.NewProgram(initialModel)
 	_, err = program.Run()
 	return err
 }

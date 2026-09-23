@@ -192,6 +192,17 @@ func (storedWorksheet worksheet) withCommittedAnswer(answer string) worksheet {
 	return storedWorksheet
 }
 
+func (storedWorksheet worksheet) withFinishedAnswer(answer string) worksheet {
+	storedWorksheet.Undo = storedWorksheet.undoSnapshot()
+	storedWorksheet.Answers = cloneAnswers(storedWorksheet.Answers)
+	if answer == "" {
+		delete(storedWorksheet.Answers, storedWorksheet.Selected)
+	} else {
+		storedWorksheet.Answers[storedWorksheet.Selected] = answer
+	}
+	return storedWorksheet
+}
+
 func (storedWorksheet worksheet) withClearedAnswer() worksheet {
 	storedWorksheet.Undo = storedWorksheet.undoSnapshot()
 	storedWorksheet.Answers = cloneAnswers(storedWorksheet.Answers)
