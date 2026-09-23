@@ -112,7 +112,7 @@ func TestCompleteHelpShowsAllNewModeBindings(t *testing.T) {
 	terminal := startTerminalWithEnvironment(t, t.TempDir(), environmentOverrides{values: map[string]string{"XDG_CONFIG_HOME": configHome}}, "5")
 	terminal.send(t, "?")
 	help := terminal.waitFor(t, "Complete Help")
-	for _, want := range []string{"Jump first: zz", "Erase: (unbound) Insert; Ctrl-H prompt"} {
+	for _, want := range []string{"Jump: zz/G", "Erase: (unbound) Insert; Ctrl-H prompt"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("Complete Help omits %q:\n%s", want, help)
 		}

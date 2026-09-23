@@ -14,8 +14,14 @@ type keyAction string
 const (
 	actionMoveDown     keyAction = "move_down"
 	actionMoveUp       keyAction = "move_up"
+	actionRebaseDown   keyAction = "rebase_down"
+	actionRebaseUp     keyAction = "rebase_up"
 	actionJumpFirst    keyAction = "jump_first"
-	actionSkip         keyAction = "skip"
+	actionJumpLast     keyAction = "jump_last"
+	actionClearAndNext keyAction = "clear_and_next"
+	actionInsertAbove  keyAction = "insert_above"
+	actionInsertBelow  keyAction = "insert_below"
+	actionDeleteSlot   keyAction = "delete_slot"
 	actionRecommended  keyAction = "recommended"
 	actionYes          keyAction = "yes"
 	actionNo           keyAction = "no"
@@ -31,9 +37,6 @@ const (
 	actionChoiceE      keyAction = "choice_e"
 	actionChoiceUpperA keyAction = "choice_upper_a"
 	actionChoiceUpperB keyAction = "choice_upper_b"
-	actionChoiceUpperC keyAction = "choice_upper_c"
-	actionChoiceUpperD keyAction = "choice_upper_d"
-	actionChoiceUpperE keyAction = "choice_upper_e"
 	actionExplain      keyAction = "explain"
 	actionInline       keyAction = "inline"
 	actionExternal     keyAction = "external"
@@ -64,10 +67,16 @@ type actionDefinition struct {
 var actionDefinitions = []actionDefinition{
 	{action: actionMoveDown, defaultBindings: []string{"down", "j", "ctrl+n"}},
 	{action: actionMoveUp, defaultBindings: []string{"up", "k", "ctrl+p"}},
+	{action: actionRebaseDown, defaultBindings: []string{"left"}},
+	{action: actionRebaseUp, defaultBindings: []string{"right"}},
 	{action: actionJumpFirst, defaultBindings: []string{"gg"}},
-	{action: actionSkip, defaultBindings: []string{"space"}},
+	{action: actionJumpLast, defaultBindings: []string{"G"}},
+	{action: actionClearAndNext, configName: "skip", defaultBindings: []string{"space"}},
+	{action: actionInsertAbove, defaultBindings: []string{"O"}},
+	{action: actionInsertBelow, defaultBindings: []string{"o"}},
+	{action: actionDeleteSlot, defaultBindings: []string{"D"}},
 	{action: actionRecommended, defaultBindings: []string{"r", "R"}, answer: "recommended"},
-	{action: actionYes, defaultBindings: []string{"y", "Y"}, answer: "yes"},
+	{action: actionYes, defaultBindings: []string{"y"}, answer: "yes"},
 	{action: actionNo, defaultBindings: []string{"n", "N"}, answer: "no"},
 	{action: actionChoice1, defaultBindings: []string{"1"}, answer: "1", choice: true},
 	{action: actionChoice2, defaultBindings: []string{"2"}, answer: "2", choice: true},
@@ -81,13 +90,10 @@ var actionDefinitions = []actionDefinition{
 	{action: actionChoiceE, defaultBindings: []string{"e"}, answer: "e", choice: true},
 	{action: actionChoiceUpperA, defaultBindings: []string{"A"}, answer: "A", choice: true},
 	{action: actionChoiceUpperB, defaultBindings: []string{"B"}, answer: "B", choice: true},
-	{action: actionChoiceUpperC, defaultBindings: []string{"C"}, answer: "C", choice: true},
-	{action: actionChoiceUpperD, defaultBindings: []string{"D"}, answer: "D", choice: true},
-	{action: actionChoiceUpperE, defaultBindings: []string{"E"}, answer: "E", choice: true},
 	{action: actionExplain, defaultBindings: []string{"x"}, answer: "explain further"},
 	{action: actionInline, defaultBindings: []string{"i"}},
-	{action: actionExternal, defaultBindings: []string{"o"}},
-	{action: actionClear, defaultBindings: []string{"esc"}},
+	{action: actionExternal, defaultBindings: []string{"E"}},
+	{action: actionClear, defaultBindings: []string{"backspace", "delete"}},
 	{action: actionUndo, defaultBindings: []string{"u"}},
 	{action: actionCopy, defaultBindings: []string{"s", "ctrl+s"}, required: true},
 	{action: actionReset, defaultBindings: []string{"ctrl+r"}},
@@ -366,25 +372,26 @@ func (binding keyBinding) display() string {
 func (configured keymap) completeHelp() string {
 	return fmt.Sprintf(`Grill TUI — Complete Help
 %s
-Jump first: %s; Skip: %s
+Jump: %s/%s; Rebase: %s/%s; Next: %s
 Presets: %s recommended; %s yes; %s no
 Choices: %s
 Explain: %s; Prompt submit: %s
 Custom: %s inline; %s external editor
+Slots: %s/%s insert; %s delete
 Inline edit: %s commit; %s cancel
 Erase: %s Insert; %s prompt
 Correct: %s clear; %s undo
-Mouse: left click select; wheel scroll
-Copy: %s
+Mouse: click/wheel; Copy: %s
 Reset: %s twice within two seconds
 Help: %s; Quit: %s
 Prompt quit: %s
 `,
-		configured.movementHelp(), configured.labels(actionJumpFirst), configured.labels(actionSkip),
+		configured.movementHelp(), configured.labels(actionJumpFirst), configured.labels(actionJumpLast), configured.labels(actionRebaseDown), configured.labels(actionRebaseUp), configured.labels(actionClearAndNext),
 		configured.labels(actionRecommended), configured.labels(actionYes), configured.labels(actionNo),
 		configured.choiceSummary(),
 		configured.labels(actionExplain), configured.labels(actionPromptSubmit),
 		configured.labels(actionInline), configured.labels(actionExternal),
+		configured.labels(actionInsertAbove), configured.labels(actionInsertBelow), configured.labels(actionDeleteSlot),
 		configured.labels(actionFinish), configured.labels(actionCancel),
 		configured.labels(actionBackspace), configured.labels(actionPromptErase),
 		configured.labels(actionClear), configured.labels(actionUndo), configured.labels(actionCopy), configured.labels(actionReset), configured.labels(actionHelp), configured.labelsWithSeparator(actionQuit, ", "),
@@ -393,13 +400,13 @@ Prompt quit: %s
 
 func (configured keymap) compactHelp() string {
 	if configured.isDefault() {
-		return "Help: ↑/↓ j/k move • Space skip • r/y/n 1-5 a-e x answer • i/o custom • Esc clear • u undo • s/Ctrl-S copy • Ctrl-R reset • ? help • q quit"
+		return "Help: ↑/↓ j/k move • ←/→ rebase • gg/G jump • Space clear+next • r/y/n 1-5 a-e A/B x answer • i/E edit • O/o insert D delete • Backspace/Delete clear • u undo • s/Ctrl-S copy • Ctrl-R reset • ? help • q quit"
 	}
-	return fmt.Sprintf("Help: %s move • %s skip • %s/%s/%s %s answer • %s/%s custom • %s clear • %s undo • %s copy • %s reset • %s help • %s quit",
-		configured.movementCompact(), configured.labels(actionSkip),
+	return fmt.Sprintf("Help: %s move • %s/%s rebase • %s/%s jump • %s clear+next • %s/%s/%s %s answer • %s/%s edit • %s/%s insert %s delete • %s clear • %s undo • %s copy • %s reset • %s help • %s quit",
+		configured.movementCompact(), configured.labels(actionRebaseDown), configured.labels(actionRebaseUp), configured.labels(actionJumpFirst), configured.labels(actionJumpLast), configured.labels(actionClearAndNext),
 		configured.labels(actionRecommended), configured.labels(actionYes), configured.labels(actionNo),
 		configured.choiceSummary(),
-		configured.labels(actionInline), configured.labels(actionExternal), configured.labels(actionClear),
+		configured.labels(actionInline), configured.labels(actionExternal), configured.labels(actionInsertAbove), configured.labels(actionInsertBelow), configured.labels(actionDeleteSlot), configured.labels(actionClear),
 		configured.labels(actionUndo), configured.labels(actionCopy), configured.labels(actionReset), configured.labels(actionHelp), configured.labels(actionQuit))
 }
 
@@ -452,7 +459,7 @@ func (configured keymap) choiceSummary() string {
 		}
 	}
 	if allDefault {
-		return "1–5; a–e/A–E"
+		return "1–5; a–e; A/B"
 	}
 	choices := make([]string, 0, len(choiceDefinitions))
 	for _, definition := range choiceDefinitions {

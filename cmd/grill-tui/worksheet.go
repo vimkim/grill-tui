@@ -9,9 +9,10 @@ import (
 )
 
 const (
-	initialAnswerSlotCount = 10
-	visibleAnswerSlotCount = 10
-	worksheetSchemaVersion = 1
+	initialAnswerSlotCount  = 10
+	visibleAnswerSlotCount  = 10
+	worksheetSchemaVersion  = 1
+	maximumAnswerSlotNumber = int(^uint(0) >> 1)
 )
 
 var (
@@ -107,6 +108,70 @@ func (storedWorksheet worksheet) withSelection(change int) (worksheet, bool) {
 	return storedWorksheet, true
 }
 
+func (storedWorksheet worksheet) withRebasedNumbers(change int) (worksheet, bool) {
+	if change == -1 && storedWorksheet.FirstNumber == 1 {
+		return storedWorksheet, false
+	}
+	if change == 1 && storedWorksheet.LastNumber == maximumAnswerSlotNumber {
+		return storedWorksheet, false
+	}
+	storedWorksheet.Undo = storedWorksheet.undoSnapshot()
+	shiftedAnswers := make(map[int]string, len(storedWorksheet.Answers))
+	for number, answer := range storedWorksheet.Answers {
+		shiftedAnswers[number+change] = answer
+	}
+	storedWorksheet.FirstNumber += change
+	storedWorksheet.LastNumber += change
+	storedWorksheet.Selected += change
+	storedWorksheet.Viewport += change
+	storedWorksheet.Answers = shiftedAnswers
+	return storedWorksheet, true
+}
+
+func (storedWorksheet worksheet) withInsertedSlot(number int) (worksheet, bool) {
+	if storedWorksheet.LastNumber == maximumAnswerSlotNumber {
+		return storedWorksheet, false
+	}
+	storedWorksheet.Undo = storedWorksheet.undoSnapshot()
+	shiftedAnswers := make(map[int]string, len(storedWorksheet.Answers))
+	for existingNumber, answer := range storedWorksheet.Answers {
+		if existingNumber >= number {
+			existingNumber++
+		}
+		shiftedAnswers[existingNumber] = answer
+	}
+	storedWorksheet.LastNumber++
+	storedWorksheet.Answers = shiftedAnswers
+	storedWorksheet.Selected = number
+	return storedWorksheet, true
+}
+
+func (storedWorksheet worksheet) withDeletedSlot() (worksheet, bool) {
+	if storedWorksheet.FirstNumber == storedWorksheet.LastNumber {
+		return storedWorksheet, false
+	}
+	storedWorksheet.Undo = storedWorksheet.undoSnapshot()
+	deleted := storedWorksheet.Selected
+	shiftedAnswers := make(map[int]string, len(storedWorksheet.Answers))
+	for number, answer := range storedWorksheet.Answers {
+		switch {
+		case number < deleted:
+			shiftedAnswers[number] = answer
+		case number > deleted:
+			shiftedAnswers[number-1] = answer
+		}
+	}
+	storedWorksheet.LastNumber--
+	storedWorksheet.Answers = shiftedAnswers
+	if storedWorksheet.Selected > storedWorksheet.LastNumber {
+		storedWorksheet.Selected = storedWorksheet.LastNumber
+	}
+	if storedWorksheet.Viewport > storedWorksheet.LastNumber {
+		storedWorksheet.Viewport = storedWorksheet.LastNumber
+	}
+	return storedWorksheet, true
+}
+
 func (storedWorksheet worksheet) withCommittedAnswer(answer string) worksheet {
 	storedWorksheet.Undo = storedWorksheet.undoSnapshot()
 	storedWorksheet.Answers = cloneAnswers(storedWorksheet.Answers)
@@ -117,8 +182,7 @@ func (storedWorksheet worksheet) withCommittedAnswer(answer string) worksheet {
 	}
 	if storedWorksheet.Selected == storedWorksheet.LastNumber {
 		lastNumber := storedWorksheet.LastNumber
-		maxInt := int(^uint(0) >> 1)
-		if lastNumber == maxInt {
+		if lastNumber == maximumAnswerSlotNumber {
 			return storedWorksheet
 		}
 		storedWorksheet.LastNumber++
@@ -133,6 +197,24 @@ func (storedWorksheet worksheet) withClearedAnswer() worksheet {
 	storedWorksheet.Answers = cloneAnswers(storedWorksheet.Answers)
 	delete(storedWorksheet.Answers, storedWorksheet.Selected)
 	return storedWorksheet
+}
+
+func (storedWorksheet worksheet) withClearedAnswerAndAdvanced() (worksheet, bool) {
+	if storedWorksheet.Selected == storedWorksheet.LastNumber && storedWorksheet.LastNumber == maximumAnswerSlotNumber {
+		return storedWorksheet, false
+	}
+	if storedWorksheet.answer(storedWorksheet.Selected) != "" || storedWorksheet.Selected == storedWorksheet.LastNumber {
+		storedWorksheet.Undo = storedWorksheet.undoSnapshot()
+	}
+	if storedWorksheet.answer(storedWorksheet.Selected) != "" {
+		storedWorksheet.Answers = cloneAnswers(storedWorksheet.Answers)
+		delete(storedWorksheet.Answers, storedWorksheet.Selected)
+	}
+	if storedWorksheet.Selected == storedWorksheet.LastNumber {
+		storedWorksheet.LastNumber++
+	}
+	storedWorksheet.Selected++
+	return storedWorksheet, true
 }
 
 func (storedWorksheet worksheet) undoSnapshot() *worksheetUndo {
@@ -181,7 +263,7 @@ func (storedWorksheet worksheet) lastAnsweredNumber() (int, bool) {
 
 func (storedWorksheet worksheet) defaultResumeNumber() int {
 	if lastAnswered, ok := storedWorksheet.lastAnsweredNumber(); ok {
-		if lastAnswered < int(^uint(0)>>1) {
+		if lastAnswered < maximumAnswerSlotNumber {
 			return lastAnswered + 1
 		}
 		return lastAnswered
@@ -221,8 +303,7 @@ func parseStartingNumber(input string) (int, error) {
 	if start < 1 {
 		return 0, errInvalidStartingNumber
 	}
-	maxInt := int(^uint(0) >> 1)
-	if start > maxInt-(initialAnswerSlotCount-1) {
+	if start > maximumAnswerSlotNumber-(initialAnswerSlotCount-1) {
 		return 0, errStartingNumberTooLarge
 	}
 	return start, nil

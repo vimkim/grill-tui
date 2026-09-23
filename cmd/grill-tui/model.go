@@ -269,16 +269,75 @@ func (model worksheetModel) handleNormalStep(step string) (worksheetModel, tea.C
 		return model, nil
 	case actionExternal:
 		return model.openExternalEditor()
-	case actionMoveDown, actionSkip:
+	case actionClearAndNext:
+		selected := model.worksheet.Selected
+		candidate, ok := model.worksheet.withClearedAnswerAndAdvanced()
+		if !ok {
+			model.status = "Answer Slot cannot advance beyond the supported integer range"
+			return model, nil
+		}
+		status := fmt.Sprintf("Answer Slot %d cleared and advanced", selected)
+		return model.persistWorksheet(candidate, status, revealSelectedSlot), nil
+	case actionMoveDown:
 		return model.moveSelection(1), nil
 	case actionMoveUp:
 		return model.moveSelection(-1), nil
+	case actionRebaseDown:
+		candidate, ok := model.worksheet.withRebasedNumbers(-1)
+		if !ok {
+			model.status = "Worksheet cannot rebase below 1"
+			return model, nil
+		}
+		return model.persistWorksheet(candidate, "Worksheet numbers rebased by -1", revealSelectedSlot), nil
+	case actionRebaseUp:
+		candidate, ok := model.worksheet.withRebasedNumbers(1)
+		if !ok {
+			model.status = "Worksheet cannot rebase beyond the supported integer range"
+			return model, nil
+		}
+		return model.persistWorksheet(candidate, "Worksheet numbers rebased by +1", revealSelectedSlot), nil
+	case actionInsertAbove:
+		selected := model.worksheet.Selected
+		candidate, ok := model.worksheet.withInsertedSlot(selected)
+		if !ok {
+			model.status = "Worksheet cannot insert beyond the supported integer range"
+			return model, nil
+		}
+		return model.persistWorksheet(candidate, fmt.Sprintf("Inserted blank Answer Slot above %d", selected), revealSelectedSlot), nil
+	case actionInsertBelow:
+		selected := model.worksheet.Selected
+		candidate, ok := model.worksheet.withInsertedSlot(selected + 1)
+		if !ok {
+			model.status = "Worksheet cannot insert beyond the supported integer range"
+			return model, nil
+		}
+		return model.persistWorksheet(candidate, fmt.Sprintf("Inserted blank Answer Slot below %d", selected), revealSelectedSlot), nil
+	case actionDeleteSlot:
+		selected := model.worksheet.Selected
+		candidate, ok := model.worksheet.withDeletedSlot()
+		if !ok {
+			model.status = "Worksheet cannot delete the only Answer Slot"
+			return model, nil
+		}
+		status := fmt.Sprintf("Deleted Answer Slot %d; range is now %d-%d", selected, candidate.FirstNumber, candidate.LastNumber)
+		return model.persistWorksheet(candidate, status, revealSelectedSlot), nil
 	case actionJumpFirst:
 		if model.worksheet.Selected == model.worksheet.FirstNumber {
 			return model, nil
 		}
 		candidate := model.worksheet
 		candidate.Selected = candidate.FirstNumber
+		return model.persistWorksheet(candidate, "Selection moved", revealSelectedSlot), nil
+	case actionJumpLast:
+		selected := model.worksheet.FirstNumber
+		if lastAnswered, ok := model.worksheet.lastAnsweredNumber(); ok {
+			selected = lastAnswered
+		}
+		if model.worksheet.Selected == selected {
+			return model, nil
+		}
+		candidate := model.worksheet
+		candidate.Selected = selected
 		return model.persistWorksheet(candidate, "Selection moved", revealSelectedSlot), nil
 	}
 	if answer, ok := model.keymap.answerFor(action); ok {

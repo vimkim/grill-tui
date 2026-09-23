@@ -30,12 +30,13 @@ var grillTUIBinary string
 const exactAnswerListFixture = "998. alpha\n1000. first 界\n      second line"
 
 var completeHelpBindingDescriptions = []string{
-	"Move: ↑/↓, j/k, Ctrl-N/Ctrl-P", "Skip: Space",
-	"Presets: r/R recommended; y/Y yes; n/N no", "Choices: 1–5; a–e/A–E",
-	"Explain: x", "Custom: i inline; o external editor",
+	"Move: ↑/↓, j/k, Ctrl-N/Ctrl-P", "Next: Space",
+	"Rebase: ←/→", "Jump: gg/G", "Slots: O/o insert; D delete",
+	"Presets: r/R recommended; y yes; n/N no", "Choices: 1–5; a–e; A/B",
+	"Explain: x", "Custom: i inline; E external editor",
 	"Inline edit: Enter commit; Esc cancel",
-	"Correct: Esc clear; u undo", "Mouse: left click select; wheel scroll",
-	"Copy: s/Ctrl-S", "Reset: Ctrl-R twice within two seconds",
+	"Correct: Backspace/Delete clear; u undo", "Mouse: click/wheel; Copy: s/Ctrl-S",
+	"Reset: Ctrl-R twice within two seconds",
 	"Help: ?; Quit: q, Ctrl-Q, Ctrl-C",
 }
 
@@ -421,12 +422,14 @@ func TestConfigDefaultsPrintsTheCompleteAuthoritativeKeymap(t *testing.T) {
 		`move_up = ["up", "k", "ctrl+p"]`,
 		`skip = ["space"]`,
 		`recommended = ["r", "R"]`,
-		`yes = ["y", "Y"]`,
+		`yes = ["y"]`,
 		`no = ["n", "N"]`,
 		`choice_1 = ["1"]`, `choice_2 = ["2"]`, `choice_3 = ["3"]`, `choice_4 = ["4"]`, `choice_5 = ["5"]`,
+		`rebase_down = ["left"]`, `rebase_up = ["right"]`, `jump_last = ["G"]`,
+		`insert_above = ["O"]`, `insert_below = ["o"]`, `delete_slot = ["D"]`,
 		`choice_a = ["a"]`, `choice_b = ["b"]`, `choice_c = ["c"]`, `choice_d = ["d"]`, `choice_e = ["e"]`,
-		`choice_upper_a = ["A"]`, `choice_upper_b = ["B"]`, `choice_upper_c = ["C"]`, `choice_upper_d = ["D"]`, `choice_upper_e = ["E"]`,
-		`explain = ["x"]`, `inline = ["i"]`, `external = ["o"]`, `clear = ["esc"]`, `undo = ["u"]`,
+		`choice_upper_a = ["A"]`, `choice_upper_b = ["B"]`,
+		`explain = ["x"]`, `inline = ["i"]`, `external = ["E"]`, `clear = ["backspace", "delete"]`, `undo = ["u"]`,
 		`copy = ["s", "ctrl+s"]`, `reset = ["ctrl+r"]`, `help = ["?"]`, `quit = ["q", "ctrl+q", "ctrl+c"]`,
 	} {
 		if !strings.Contains(result.stdout, line+"\n") && result.stdout != line+"\n" {
@@ -477,7 +480,7 @@ func TestOptionalActionCanBeUnbound(t *testing.T) {
 		"XDG_CONFIG_HOME": configHome,
 	}}, "5")
 
-	terminal.send(t, "o")
+	terminal.send(t, "E")
 	time.Sleep(50 * time.Millisecond)
 	mark := len(terminal.output.String())
 	terminal.send(t, "?")
@@ -746,7 +749,7 @@ func TestResizeReflowsViewportAroundSelectedAnswerSlot(t *testing.T) {
 	mark := len(terminal.output.String())
 	terminal.resize(t, 80, 16)
 	compact := terminal.waitForAfter(t, mark, "Selected Answer 14 (full):")
-	assertVisibleAnswerSlotRange(t, compact, 11, 14)
+	assertVisibleAnswerSlotRange(t, compact, 12, 14)
 
 	mark = len(terminal.output.String())
 	terminal.resize(t, 80, 24)
@@ -775,7 +778,7 @@ func TestCompactHeightKeepsSelectionVisibleAcrossNavigationCommitAndUndo(t *test
 	mark = len(terminal.output.String())
 	terminal.send(t, "?")
 	navigated := terminal.waitForAfter(t, mark, "Selected Answer 9 (full):")
-	assertVisibleAnswerSlotRange(t, navigated, 6, 9)
+	assertVisibleAnswerSlotRange(t, navigated, 7, 9)
 
 	terminal.send(t, "i")
 	terminal.waitFor(t, "Inline Custom Answer 9:")
@@ -788,7 +791,7 @@ func TestCompactHeightKeepsSelectionVisibleAcrossNavigationCommitAndUndo(t *test
 	mark = len(terminal.output.String())
 	terminal.send(t, "?")
 	committed := terminal.waitForAfter(t, mark, "Selected Answer 10 (full):")
-	assertVisibleAnswerSlotRange(t, committed, 7, 10)
+	assertVisibleAnswerSlotRange(t, committed, 8, 10)
 
 	mark = len(terminal.output.String())
 	terminal.send(t, "u")
@@ -799,7 +802,7 @@ func TestCompactHeightKeepsSelectionVisibleAcrossNavigationCommitAndUndo(t *test
 	mark = len(terminal.output.String())
 	terminal.send(t, "?")
 	undone := terminal.waitForAfter(t, mark, "Undid Answer Slot 9")
-	assertVisibleAnswerSlotRange(t, undone, 6, 9)
+	assertVisibleAnswerSlotRange(t, undone, 7, 9)
 
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
@@ -828,7 +831,7 @@ func TestInlineCancelAfterCompactResizeKeepsSelectionVisible(t *testing.T) {
 	mark = len(terminal.output.String())
 	terminal.send(t, "?")
 	worksheet := terminal.waitForAfter(t, mark, "Inline Custom Answer cancelled")
-	assertVisibleAnswerSlotRange(t, worksheet, 6, 9)
+	assertVisibleAnswerSlotRange(t, worksheet, 7, 9)
 
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
@@ -842,7 +845,7 @@ printf 'first line\nsecond line\nthird line' > "$1"
 		values:  map[string]string{"VISUAL": editor},
 		removed: []string{"EDITOR"},
 	}, "5")
-	terminal.send(t, "o")
+	terminal.send(t, "E")
 	terminal.waitForSelection(t, 6)
 	terminal.send(t, "k")
 	terminal.waitForSelection(t, 5)
@@ -909,7 +912,7 @@ func TestMouseClickSelectsVisibleAnswerSlotAtCompactHeight(t *testing.T) {
 	}
 
 	terminal.send(t, sgrMousePress(10, 6, 0))
-	terminal.waitForSelection(t, 5)
+	terminal.waitForSelection(t, 6)
 
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
@@ -927,14 +930,14 @@ printf 'first line\nsecond line\nthird line' > "$1"
 		terminal.send(t, "j")
 		terminal.waitForSelection(t, selected)
 	}
-	terminal.send(t, "o")
+	terminal.send(t, "E")
 	terminal.waitForSelection(t, 9)
 	for selected := 8; selected >= 5; selected-- {
 		terminal.send(t, "k")
 		terminal.waitForSelection(t, selected)
 	}
 
-	terminal.resize(t, 80, 16)
+	terminal.resize(t, 80, 18)
 	terminal.waitFor(t, "Selected Answer 5 (full):")
 	terminal.send(t, sgrMousePress(10, 9, 0))
 	terminal.waitForSelection(t, 8)
@@ -945,7 +948,7 @@ printf 'first line\nsecond line\nthird line' > "$1"
 	mark = len(terminal.output.String())
 	terminal.send(t, "?")
 	worksheet := terminal.waitForAfter(t, mark, "Selected Answer 8 (full):")
-	assertVisibleAnswerSlotRange(t, worksheet, 7, 8)
+	assertVisibleAnswerSlotRange(t, worksheet, 6, 8)
 
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
@@ -1107,7 +1110,7 @@ func TestDefaultNavigationFamiliesMoveSelection(t *testing.T) {
 	}
 }
 
-func TestSpaceAdvancesWithoutEditingOrGrowingWorksheet(t *testing.T) {
+func TestSpaceClearsAdvancesAndGrowsWorksheet(t *testing.T) {
 	workingDir := t.TempDir()
 	terminal := startTerminal(t, workingDir, "8")
 
@@ -1122,7 +1125,7 @@ func TestSpaceAdvancesWithoutEditingOrGrowingWorksheet(t *testing.T) {
 		terminal.waitForSelection(t, number)
 	}
 	terminal.send(t, " ")
-	time.Sleep(50 * time.Millisecond)
+	terminal.waitForSelection(t, 18)
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
@@ -1131,14 +1134,14 @@ func TestSpaceAdvancesWithoutEditingOrGrowingWorksheet(t *testing.T) {
 	resumed.send(t, "q")
 	resumed.waitForExit(t)
 	screen := cleanTerminalOutput(resumed.output.String())
-	if slots := answerSlotLinePattern.FindAllStringSubmatch(screen, -1); len(slots) != 10 {
-		t.Fatalf("Space at the final Answer Slot rendered %d slots, want 10:\n%s", len(slots), screen)
+	if !strings.Contains(screen, "11 Answer Slots") {
+		t.Fatalf("Space at the final Answer Slot did not append a slot:\n%s", screen)
 	}
 	if !regexp.MustCompile(`(?m)^> 17 │ $`).MatchString(screen) {
-		t.Fatalf("Space changed the selected Answer Slot instead of leaving it empty:\n%s", screen)
+		t.Fatalf("reopening did not select the requested empty Answer Slot:\n%s", screen)
 	}
-	if !strings.Contains(screen, "  8 │ recommended") {
-		t.Fatalf("Space changed the existing answer instead of preserving it:\n%s", screen)
+	if strings.Contains(screen, "8 │ recommended") {
+		t.Fatalf("Space did not clear the existing answer:\n%s", screen)
 	}
 }
 
@@ -1151,7 +1154,6 @@ func TestPresetAnswerFamiliesCommitExactValuesAndAutoAdvance(t *testing.T) {
 		{name: "lowercase recommended", key: "r", answer: "recommended"},
 		{name: "uppercase recommended", key: "R", answer: "recommended"},
 		{name: "lowercase yes", key: "y", answer: "yes"},
-		{name: "uppercase yes", key: "Y", answer: "yes"},
 		{name: "lowercase no", key: "n", answer: "no"},
 		{name: "uppercase no", key: "N", answer: "no"},
 		{name: "digit 1", key: "1", answer: "1"},
@@ -1166,9 +1168,6 @@ func TestPresetAnswerFamiliesCommitExactValuesAndAutoAdvance(t *testing.T) {
 		{name: "lowercase e", key: "e", answer: "e"},
 		{name: "uppercase A", key: "A", answer: "A"},
 		{name: "uppercase B", key: "B", answer: "B"},
-		{name: "uppercase C", key: "C", answer: "C"},
-		{name: "uppercase D", key: "D", answer: "D"},
-		{name: "uppercase E", key: "E", answer: "E"},
 	}
 
 	for _, test := range tests {
@@ -1224,7 +1223,7 @@ func TestInlineCustomAnswerIsSeededAndEscapeCancelsWithoutChangingAnswer(t *test
 	terminal.waitForExit(t)
 }
 
-func TestNormalModeEscapeClearsSelectedAnswerAndPersists(t *testing.T) {
+func TestNormalModeEscapeIsInertAndPreservesAnswer(t *testing.T) {
 	workingDir := t.TempDir()
 	terminal := startTerminal(t, workingDir, "30")
 	terminal.send(t, "r")
@@ -1233,17 +1232,14 @@ func TestNormalModeEscapeClearsSelectedAnswerAndPersists(t *testing.T) {
 	terminal.waitForSelection(t, 30)
 
 	terminal.send(t, "\x1b")
-	screen := terminal.waitFor(t, "Answer Slot 30 cleared")
-	if answer := latestRenderedAnswer(t, screen, 30); answer != "" {
-		t.Fatalf("cleared Answer Slot contains %q, want empty:\n%s", answer, screen)
-	}
+	time.Sleep(100 * time.Millisecond)
 	terminal.send(t, "q")
 	terminal.waitForExit(t)
 
 	resumed := startTerminal(t, workingDir, "30")
-	screen = resumed.waitForSelection(t, 30)
-	if answer := latestRenderedAnswer(t, screen, 30); answer != "" {
-		t.Fatalf("cleared Answer Slot contains %q after restart, want empty:\n%s", answer, screen)
+	screen := resumed.waitForSelection(t, 30)
+	if answer := latestRenderedAnswer(t, screen, 30); answer != "recommended" {
+		t.Fatalf("Normal Mode Esc changed Answer Slot 30 to %q:\n%s", answer, screen)
 	}
 	resumed.send(t, "q")
 	resumed.waitForExit(t)
@@ -1306,7 +1302,7 @@ printf 'external answer' > "$1"
 		values:  map[string]string{"VISUAL": editor},
 		removed: []string{"EDITOR"},
 	}, "30")
-	terminal.send(t, "o")
+	terminal.send(t, "E")
 	terminal.waitForSelection(t, 31)
 
 	assertUndoRestoresAnswer(t, terminal, 30, "")
@@ -1320,7 +1316,7 @@ func TestUndoClearRestoresClearedAnswer(t *testing.T) {
 	terminal.waitForSelection(t, 31)
 	terminal.send(t, "k")
 	terminal.waitForSelection(t, 30)
-	terminal.send(t, "\x1b")
+	terminal.send(t, "\x7f")
 	terminal.waitFor(t, "Answer Slot 30 cleared")
 
 	assertUndoRestoresAnswer(t, terminal, 30, "recommended")
@@ -1333,7 +1329,7 @@ func TestClearingEmptySlotDoesNotReplaceAvailableUndo(t *testing.T) {
 	terminal.send(t, "r")
 	terminal.waitForSelection(t, 31)
 
-	terminal.send(t, "\x1b")
+	terminal.send(t, "\x7f")
 	terminal.waitFor(t, "Answer Slot 31 is already empty")
 	assertUndoRestoresAnswer(t, terminal, 30, "")
 	terminal.send(t, "q")
@@ -1455,7 +1451,7 @@ printf 'wrong editor' > "$1"
 	terminal.send(t, "k")
 	terminal.waitForSelection(t, 30)
 
-	terminal.send(t, "o")
+	terminal.send(t, "E")
 	screen := terminal.waitForSelection(t, 31)
 	if !strings.Contains(screen, "  30 │ first line second 界 line") {
 		t.Fatalf("external-editor answer was not compact in the grid:\n%s", screen)
@@ -1505,7 +1501,7 @@ printf 'grown\nanswer' > "$1"
 		terminal.waitForSelection(t, selected)
 	}
 
-	terminal.send(t, "o")
+	terminal.send(t, "E")
 	screen := terminal.waitForSelection(t, 50)
 	if !strings.Contains(screen, "11 Answer Slots") || !strings.Contains(screen, "  49 │ grown answer") {
 		t.Fatalf("$EDITOR fallback did not commit and grow the Worksheet:\n%s", screen)
@@ -1562,7 +1558,7 @@ func TestExternalEditorErrorsAreActionableAndLeaveAnswerUnchanged(t *testing.T) 
 			terminal.send(t, "k")
 			terminal.waitForSelection(t, 60)
 
-			terminal.send(t, "o")
+			terminal.send(t, "E")
 			screen := terminal.waitFor(t, test.status)
 			if !strings.Contains(screen, "> 60 │ recommended") || !strings.Contains(screen, "Selected Answer 60 (full):\nrecommended") {
 				t.Fatalf("editor error changed the selected Answer Slot:\n%s", screen)
@@ -2138,7 +2134,7 @@ printf '%s\n' "$index" > "$index_file"
 			currentNumber++
 			terminal.waitForSelection(t, currentNumber)
 		}
-		terminal.send(t, "o")
+		terminal.send(t, "E")
 		currentNumber = number + 1
 		terminal.waitForSelection(t, currentNumber)
 	}
