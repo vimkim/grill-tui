@@ -4,12 +4,12 @@ Question: which responsive layout makes named Worksheets, a contextual action ba
 
 ## Variant verdict
 
-- Preferred variant or combination:
-- Header:
-- Worksheet navigation:
-- Preview and Insert Mode:
-- Status and action bar:
-- What to discard:
+- Preferred variant or combination: **Responsive Ledger**, selected by the user after running the interactive prototype.
+- Header: keep the shared named-Worksheet identity and range/count summary.
+- Worksheet navigation: keep the full-width ledger as the primary visual surface so question numbers and answer summaries remain easy to scan.
+- Preview and Insert Mode: keep the dedicated panel directly below the ledger; it becomes the wrapped multiline editor without replacing the surrounding Worksheet context.
+- Status and action bar: keep the separate status message and concise, mode-specific action summary.
+- What to discard: do not use Split Workbench's permanent side-by-side inspector or Focus Canvas's question-map/quick-action columns as the production structure.
 
 ## Size checks
 
@@ -33,6 +33,6 @@ Question: which responsive layout makes named Worksheets, a contextual action ba
 
 ## Decision
 
-- Keep:
-- Change:
-- Open question:
+- Keep: Responsive Ledger's hierarchy and responsive stacking, the capped wide-screen content width, and the Bubbles v2 textarea behavior.
+- Change: rewrite the winning structure under production constraints with persistence, configurable bindings, complete error handling, and tests; do not promote prototype code directly.
+- Open question: none for the visual structure. Exact colors and spacing may be refined during production implementation without changing the accepted hierarchy.
